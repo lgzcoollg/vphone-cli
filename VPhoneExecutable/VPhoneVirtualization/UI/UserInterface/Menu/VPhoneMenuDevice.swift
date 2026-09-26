@@ -32,6 +32,16 @@ extension VPhoneMenuController {
             action: #selector(typeFromClipboard),
             symbol: "keyboard",
         ))
+        // Trackpad scroll and pinch arrive as ordinary NSEvents; the view turns
+        // them into guest touches. Off hands both back to AppKit untouched.
+        let trackpadItem = makeItem(
+            "Trackpad Scroll & Pinch to Touch",
+            action: #selector(toggleTrackpadGestures),
+            symbol: "hand.draw",
+        )
+        trackpadItem.state = VPhoneTrackpadGestures.isEnabled ? .on : .off
+        trackpadGesturesItem = trackpadItem
+        menu.addItem(trackpadItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(makePanelItem(.controls, "Controls", keyEquivalent: "k", symbol: "slider.horizontal.3"))
         menu.addItem(NSMenuItem.separator())
@@ -75,6 +85,15 @@ extension VPhoneMenuController {
 
     @objc func typeFromClipboard() {
         keySender.typeFromClipboard()
+    }
+
+    /// Replays trackpad scroll and pinch inside the guest instead of letting
+    /// AppKit scroll the window. Persisted, so the choice survives relaunches.
+    @objc func toggleTrackpadGestures() {
+        let enabled = !VPhoneTrackpadGestures.isEnabled
+        VPhoneTrackpadGestures.isEnabled = enabled
+        trackpadGesturesItem?.state = enabled ? .on : .off
+        captureView?.trackpadGesturesEnabled = enabled
     }
 
     // MARK: - Restart

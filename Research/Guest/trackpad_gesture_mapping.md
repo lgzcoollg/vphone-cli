@@ -12,7 +12,8 @@ and the trade-offs that are load-bearing.
 | Two-finger scroll          | One finger presses under the pointer and follows the physical motion, then lifts |
 | Two-finger pinch (magnify) | Two fingers spreading/closing horizontally around the pointer         |
 
-Both are host-side translations of `NSEvent`s in `VPhoneVirtualMachineView`
+Both are host-side translations of `NSEvent`s in
+`VPhoneExecutable/VPhoneVirtualization/UI/VirtualMachine/VPhoneVirtualMachineView.swift`
 (`scrollWheel(with:)` / `magnify(with:)`). The guest never sees a scroll or
 magnify event — it sees an ordinary drag or pinch.
 
@@ -20,9 +21,10 @@ A swipe keeps scrolling for as long as the trackpad keeps reporting travel: it
 is **not** bounded by where the pointer sits or by the size of the window (see
 "Edge re-anchoring" below).
 
-Toggle: **Keys → Trackpad Scroll & Pinch to Touch** (on by default).
-Persisted as `trackpadGesturesEnabled` (`UserDefaults` key
-`trackpadGesturesDisabled`).
+Toggle: **Device → Trackpad Scroll & Pinch to Touch** (on by default). The menu
+item lives in `VPhoneMenuDevice.swift` next to the other input switches and
+writes through to the window's view; persisted as `trackpadGesturesEnabled`
+(`UserDefaults` key `trackpadGesturesDisabled`).
 
 ---
 
@@ -33,17 +35,20 @@ whichever touch channel the running base uses:
 
 | Base                              | Channel                                                          |
 | --------------------------------- | ---------------------------------------------------------------- |
-| iOS 18 (`useGuestTouchInjection`) | vphoned `{"t":"touch"}` / `{"t":"touch2"}` → `vp_hid_touch[_2]()` → `IOHIDEventCreateDigitizerEvent` |
+| iOS 18 (`useGuestTouchInjection`) | vphoned `input.touch` (one finger, icli) / `input.touch2` (two fingers, `vp_hid_touch2` in `VPhoneDaemon/Native/vphoned_touch.m`) |
 | iOS 26                            | Native VZ `_VZTouch(view:index:phase:location:swipeAim:timestamp:)` × N inside one `_VZMultiTouchEvent` |
 
 A guest that predates `touch2` advertises no `touch2` capability
-(`VPhoneControl.supportsMultiTouch`), so pinch degrades to a single-finger move
-there; the auto-update push normally brings the new agent in.
+(`VPhoneGuestControl.supportsMultiTouch`), so pinch degrades to a single-finger
+move there; the auto-update push normally brings the new agent in.
 
-`vp_hid_touch` (single finger) and `vp_hid_touch2` share one
-`dispatch_digitizer_points()` helper. Finger 0 keeps `index = 1, identity = 2`
-so the pre-existing single-touch path is bit-for-bit unchanged; additional
-fingers carry their own identity so the guest tracks them separately.
+**Why the guest has its own injection path at all.** icli — the guest's general
+automation package — carries exactly one digitizer point per event
+(`TouchEvent{phase, x, y, delayMS}` → `icli_hid_touch(phase, x, y)`), so a pinch
+cannot be expressed through it. `VPhoneDaemon` therefore builds two-finger hand
+events itself over the same private digitizer API. Finger 0 keeps
+`index = 1, identity = 2` so the icli-driven single-finger path is unchanged; the
+second finger carries its own identity so the guest tracks it separately.
 
 `allowOutside` forwards coordinates past the view instead of clamping them.
 Keep it: the finger model runs past the edge on purpose during a re-anchor, and

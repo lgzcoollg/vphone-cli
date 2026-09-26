@@ -40,6 +40,7 @@ class VPhoneMenuController {
     }
 
     var touchIDMenuItem: NSMenuItem?
+    var trackpadGesturesItem: NSMenuItem?
     var locationProvider: VPhoneLocationProvider?
     var locationMenuItem: NSMenuItem?
     var locationPresetMenuItem: NSMenuItem?
