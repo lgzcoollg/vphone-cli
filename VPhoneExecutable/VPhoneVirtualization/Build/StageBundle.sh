@@ -1,0 +1,96 @@
+#!/bin/zsh
+# vphone-tier: build
+set -euo pipefail
+
+root="$(cd "${0:a:h}/../../.." && pwd)"
+configuration="${CONFIGURATION:?}"
+bundle="${TARGET_BUILD_DIR:?}/${FULL_PRODUCT_NAME:?}"
+macos="$bundle/Contents/MacOS"
+resources="$bundle/Contents/Resources"
+# Host programs run from Contents/MacOS. Everything installed into the guest
+# lives in guest-resources and never runs on the Mac.
+guest="$resources/guest-resources"
+
+# Xcode exports the bundle target's SDK and package paths to build phases. Nested
+# xcodebuild must resolve each project's own graph, especially the iOS daemon.
+build_project() {
+    /usr/bin/env -i HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+        PATH="/usr/bin:/bin:/usr/sbin:/sbin" /usr/bin/xcodebuild "$@"
+}
+
+build_project -project "$root/VPhoneExecutable/VPhoneCommand/VPhoneRestore/VPhoneRestore.xcodeproj" \
+    -scheme VPhoneRestore -configuration "$configuration" \
+    -destination 'platform=macOS,arch=arm64' \
+    -derivedDataPath "$root/.build/XcodeRestore" CODE_SIGNING_ALLOWED=NO build
+
+build_project -project "$root/VPhoneExecutable/VPhoneCommand/VPhoneCommand.xcodeproj" \
+    -scheme VPhoneCommand -configuration "$configuration" \
+    -destination 'platform=macOS,arch=arm64' \
+    -derivedDataPath "$root/.build/XcodeCommand" CODE_SIGNING_ALLOWED=NO build
+
+build_project -project "$root/VPhoneDaemon/VPhoneDaemon.xcodeproj" \
+    -scheme vphoned -configuration "$configuration" \
+    -destination 'generic/platform=iOS' \
+    -derivedDataPath "$root/.build/XcodeDaemon" CODE_SIGNING_ALLOWED=NO build
+
+build_project -project "$root/VPhoneExecutable/VPhoneEscalator/VPhoneEscalator.xcodeproj" \
+    -scheme VPhoneEscalator -configuration "$configuration" \
+    -destination 'platform=macOS,arch=arm64e' \
+    -derivedDataPath "$root/.build/XcodeAMFIAllow" CODE_SIGNING_ALLOWED=NO build
+
+/usr/bin/make -C "$root/VPhoneGuestComponents" OUT="$root/.build/guest-components" all
+
+command_products="$root/.build/XcodeCommand/Build/Products/$configuration"
+daemon_products="$root/.build/XcodeDaemon/Build/Products/$configuration-iphoneos"
+amfi_products="$root/.build/XcodeAMFIAllow/Build/Products/$configuration"
+guest_products="$root/.build/guest-components/stage"
+
+# The iOS 26 Swift runtime lacks this symbol. Swift Collections 1.7.0 emits
+# it with Xcode 27 even when vphoned targets iOS 15, causing a dyld crash loop.
+if /usr/bin/nm -u "$daemon_products/vphoned" | /usr/bin/grep -q '_swift_initBorrow'; then
+    print -u2 -- "vphoned requires _swift_initBorrow, which is unavailable on iOS 26"
+    exit 1
+fi
+
+/bin/rm -rf "$macos" "$resources"
+/bin/mkdir -p "$macos" "$guest"
+/bin/cp "$TARGET_BUILD_DIR/vphone-vm" "$macos/vphone-vm"
+/bin/cp "$command_products/vphone-cli" "$macos/vphone-cli"
+/bin/cp "$amfi_products/vphone-escalator" "$macos/vphone-escalator"
+/bin/cp "$daemon_products/vphoned" "$guest/vphoned"
+/bin/cp "$root/VPhoneDaemon/Configuration/vphoned.plist" "$guest/vphoned.plist"
+/bin/cp "$guest_products/launchhook/launchdhook-vphone.dylib" "$guest/launchdhook-vphone.dylib"
+/bin/cp "$guest_products/systemhook/SystemHook-vphone.dylib" "$guest/SystemHook-vphone.dylib"
+/bin/cp "$guest_products/camfix/libcamfix.dylib" "$guest/libcamfix.dylib"
+/bin/cp "$guest_products/locationfix/libvlocation.dylib" "$guest/libvlocation.dylib"
+/bin/cp "$guest_products/camfix/libcamfix.plist" "$guest/libcamfix.plist"
+/bin/cp "$guest_products/vcamcaptured/libvcamcaptured.dylib" "$guest/libvcamcaptured.dylib"
+/bin/cp "$guest_products/vcamcaptured/libvcamcaptured.plist" "$guest/libvcamcaptured.plist"
+/bin/cp "$guest_products/gpu/libAppleParavirtCompilerPluginIOGPUFamily.dylib" \
+    "$guest/libAppleParavirtCompilerPluginIOGPUFamily.dylib"
+
+"${0:a:h}/SyncStrings.sh"
+for catalog in Localizable InfoPlist; do
+    /usr/bin/xcrun xcstringstool compile \
+        "$root/VPhoneExecutable/VPhoneVirtualization/Resources/$catalog.xcstrings" \
+        --output-directory "$resources"
+done
+
+# vphone-vm needs Swift's span back-deployment library on macOS 15. Xcode's
+# generic bundle has no main executable. Use a private load name for the VM child.
+compatibility_library="$(/usr/bin/xcrun swift-stdlib-tool --print \
+    --scan-executable "$macos/vphone-vm" --platform macosx | \
+    /usr/bin/grep '/libswiftCompatibilitySpan.dylib$')"
+/bin/cp "$compatibility_library" "$macos/libswiftCompatibilitySpan.vphone.dylib"
+/usr/bin/install_name_tool -change @rpath/libswiftCompatibilitySpan.dylib \
+    @loader_path/libswiftCompatibilitySpan.vphone.dylib "$macos/vphone-vm"
+/bin/rm -f "$bundle/Contents/Frameworks/libswiftCompatibilitySpan.dylib"
+
+/usr/bin/codesign --force --sign - "$macos/vphone-cli"
+/usr/bin/codesign --force --sign - --entitlements "$root/VPhoneDaemon/Configuration/VPhoneDaemon.entitlements" "$guest/vphoned"
+/usr/bin/codesign --force --sign - "$macos/vphone-escalator"
+/usr/bin/codesign --force --sign - "$macos/libswiftCompatibilitySpan.vphone.dylib"
+/usr/bin/codesign --force --sign - --entitlements "$root/VPhoneExecutable/VPhoneVirtualization/Resources/VPhoneVirtualization.entitlements" "$macos/vphone-vm"
+/usr/bin/codesign --force --sign - "$bundle"
+
+"${0:a:h}/ValidateBundle.sh" "$bundle"
