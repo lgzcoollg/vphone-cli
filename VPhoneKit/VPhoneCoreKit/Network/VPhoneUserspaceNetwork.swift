@@ -50,6 +50,8 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     private let attachment: VZFileHandleNetworkDeviceAttachment
     private let queue: DispatchQueue
     private static let log = Logger(subsystem: "com.vphone.tunnel", category: "frames")
+    /// Reused across frames; see the note on the UDP forwarder's buffer.
+    private var frameBuffer = [UInt8](repeating: 0, count: VPhoneUserspaceNetwork.frameCapacity)
     private var source: DispatchSourceRead?
     /// Set by `stop()`. Cancelling the read source closes our descriptor once no
     /// handler is running, so the pair cannot be reopened after that.
@@ -152,13 +154,12 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     // MARK: - Frame loop
 
     private func drain() {
-        var buffer = [UInt8](repeating: 0, count: Self.frameCapacity)
         while true {
-            let received = buffer.withUnsafeMutableBytes { raw in
+            let received = frameBuffer.withUnsafeMutableBytes { raw in
                 recv(socket, raw.baseAddress, raw.count, 0)
             }
             if received <= 0 { return } // EAGAIN once the queue is empty
-            let frame = Array(buffer[0 ..< received])
+            let frame = Array(frameBuffer[0 ..< received])
             if let ethernet = VPhoneEthernetFrame(bytes: frame) {
                 let kind = VPhoneEtherType(rawValue: ethernet.etherType)
                 let summary = kind == .ipv4

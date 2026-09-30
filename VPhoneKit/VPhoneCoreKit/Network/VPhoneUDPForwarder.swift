@@ -90,6 +90,10 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
     private var sessions: [VPhoneUDPFlowKey: Session] = [:]
     private var reaper: DispatchSourceTimer?
     private var isStopped = false
+    /// Reused for every read. Allocating and zeroing a maximum-sized datagram on
+    /// each burst is real work at QUIC rates, where hundreds of packets a second
+    /// is ordinary. Only touched on `queue`.
+    private var readBuffer = [UInt8](repeating: 0, count: VPhoneUDPForwarder.datagramCapacity)
 
     /// Marks `queue` as ours, so `sessionCount` can tell whether it is already on
     /// it rather than deadlocking against itself.
@@ -209,7 +213,7 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
         source.setCancelHandler { close(descriptor) }
         source.resume()
         sessions[key] = session
-        Self.log.info("udp flow \(String(describing: flow.destinationAddress), privacy: .public):\(flow.destinationPort, privacy: .public) from :\(flow.sourcePort, privacy: .public) -> \(String(describing: destination.address), privacy: .public):\(destination.port, privacy: .public)")
+        Self.log.debug("udp flow \(String(describing: flow.destinationAddress), privacy: .public):\(flow.destinationPort, privacy: .public) from :\(flow.sourcePort, privacy: .public) -> \(String(describing: destination.address), privacy: .public):\(destination.port, privacy: .public)")
         return session
     }
 
@@ -229,15 +233,14 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
     }
 
     private func drain(_ session: Session) {
-        var buffer = [UInt8](repeating: 0, count: Self.datagramCapacity)
         while true {
-            let received = buffer.withUnsafeMutableBytes { raw in
+            let received = readBuffer.withUnsafeMutableBytes { raw in
                 recv(session.socket, raw.baseAddress, raw.count, 0)
             }
             if received <= 0 { return } // EAGAIN, or an ICMP error on the flow
             session.lastActivity = Date()
-            Self.log.info("udp reply \(received, privacy: .public)B from \(String(describing: session.destination.address), privacy: .public):\(session.destination.port, privacy: .public)")
-            deliver(session.flow, Array(buffer[0 ..< received]))
+            Self.log.debug("udp reply \(received, privacy: .public)B from \(String(describing: session.destination.address), privacy: .public):\(session.destination.port, privacy: .public)")
+            deliver(session.flow, Array(readBuffer[0 ..< received]))
         }
     }
 
