@@ -43,6 +43,22 @@ Also excluded by existing project rules:
 
 Unprivileged, self-contained designs only.
 
+One clarification, because it is easy to misread: *unprivileged* here means *no
+additional privilege*, not *no entitlements*. `vphone-vm` already carries
+`com.apple.vm.networking`, and every attachment in play sits inside that same
+set:
+
+| attachment | needs `com.apple.vm.networking` |
+| --- | --- |
+| `VZNATNetworkDeviceAttachment` | yes |
+| `VZBridgedNetworkDeviceAttachment` | yes (it also gates interface enumeration) |
+| `VZFileHandleNetworkDeviceAttachment` | no |
+
+The v1.x work emphasised "no entitlement needed" because `gvproxy` was a
+separate process and could not inherit `vphone-vm`'s entitlements. A stack built
+into the bundle runs inside `vphone-vm` and is in that same set either way. So
+the new mode's advantage is **not** privilege — it is the egress path.
+
 ## Candidate designs
 
 ### A. A userspace stack in Swift
