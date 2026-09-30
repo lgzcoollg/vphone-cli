@@ -127,6 +127,76 @@ they are behind one.
 | new `VPhoneKit/.../Support/VPhoneUserspaceNetwork*.swift` | the stack (frame I/O, ARP/DHCP/ICMP, UDP/DNS, TCP) |
 | `VPhoneExecutable/.../VirtualMachine/VPhoneVirtualMachine.swift` | owns the backend's lifetime across a boot |
 
+## Costing A against the privileged designs
+
+With privilege on the table the useful comparison is not "Swift vs C" but **where
+the TCP state machine lives**. That is the single largest block of work in A, and
+it has a variant that removes it entirely.
+
+### A — a userspace stack (~1900–2400 lines)
+
+| part | lines |
+| --- | --- |
+| frame I/O over the attachment's socketpair | 150 |
+| Ethernet + IPv4 parse/build/checksum | 300 |
+| ARP (answer the guest's gateway lookup) | 80 |
+| DHCP (discover/offer/request/ack + options) | 200 |
+| ICMP echo | 60 |
+| UDP termination + forwarding | 200 |
+| **TCP termination** (state machine, sequence bookkeeping, windows, MSS, retransmit) | **800–1200** |
+
+Privilege: none. Host state: none. Risk: TCP correctness against iOS's real
+stack, and anything that stack does that a simplified peer mishandles.
+
+### E — `utun` plus userland NAT (~900–1100 lines)
+
+The insight is that **an address-and-port translation needs no TCP state at
+all**. If the only thing we rewrite is the IPv4 header's source address and the
+source port of the transport header — *not* the sequence numbers — then the
+guest's TCP talks to the server's TCP end to end, and both ends keep their own
+bookkeeping. We never look at a sequence number.
+
+```
+guest SYN(src 192.168.127.3:51000 -> 1.1.1.1:443)
+  → rewrite to (utun-addr:port) → write to utun → kernel routes it → VPN
+  ← reply to (utun-addr:port) → kernel delivers to us → rewrite back → guest
+```
+
+Because the rewritten packet is sourced from an address the host owns, the
+kernel treats it as its own egress: normal routing, VPN included, no
+`ipforwarding`, no pf.
+
+| part | lines |
+| --- | --- |
+| frame I/O, Ethernet + IPv4, ARP, DHCP, ICMP | (same as A) ≈ 790 |
+| **connection table + header rewrite + checksums** (replaces A's TCP block) | **300–400** |
+| utun create/configure/teardown | 150 |
+
+Privilege: **root** (creating a utun). Host state: **one utun interface** while
+running, which must be torn down on exit, on SIGINT, and swept after a crash.
+
+An alternative variant lets `pf` do the translation instead of us — that trades
+~350 lines of rewrite code for ~350 lines of `/dev/pf` rule programming plus a
+system dependency, and buys nothing. Rewriting ourselves is smaller and keeps
+the failure surface inside our process.
+
+### The comparison, without the round numbers
+
+| | A | E |
+| --- | --- | --- |
+| lines | 1900–2400 | 900–1100 |
+| who runs the TCP stack | **us** | **the guest and the server** |
+| privilege | none | root (utun only) |
+| host state to clean up | none | one utun |
+| main risk | TCP edge cases on a real iOS stack | connection tracking + privilege/teardown |
+| fits "system libraries and its own built contents" | yes | yes (still no external binary) |
+
+E is roughly **half** the code, and it deletes the part most likely to be subtly
+wrong. Against that: it needs root, and vphone-cli's stated contract is that it
+never obtains root itself — so E has to come with an answer for privilege (a new
+helper path, or an explicit one-time `sudo`), and with a teardown story for the
+interface it leaves behind.
+
 ## Validation
 
 Same shape as the v1.x work, but without the helper: drive the transport the
