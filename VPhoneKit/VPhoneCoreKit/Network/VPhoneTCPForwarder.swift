@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 // MARK: - Flow
 
@@ -64,7 +65,16 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     /// What we tell the guest it may send us before waiting. Fixed: we do not
     /// advertise window scaling, so this is the whole window.
     private static let advertisedWindow: UInt16 = 65535
+    /// Largest segment we will send the guest: the DHCP-advertised MTU less the
+    /// IPv4 and TCP headers. Sent as option 2 in the SYN-ACK.
+    private static let ourMSS = 1240
+    /// What to assume when the guest's SYN carries no MSS option. RFC 1122's
+    /// floor, chosen so an unadvertised peer never gets an oversized segment.
+    private static let defaultPeerMSS = 536
+    /// One read at a time from the host. Larger than an MSS on purpose: fewer
+    /// syscalls, and the split into segments happens below anyway.
     private static let readCapacity = 65536
+    private static let log = Logger(subsystem: "com.vphone.tunnel", category: "tcp")
 
     private enum State {
         /// SYN seen, host connect in flight.
@@ -95,14 +105,18 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         /// Set once we have sent the guest a FIN.
         var hostClosed = false
         var lastActivity = Date()
+        /// The guest's MSS from its SYN, or the RFC floor when it sent none.
+        /// Every segment we build is split to fit it.
+        var peerMSS: Int
 
-        init(flow: VPhoneTCPFlow, socket: Int32, readSource: DispatchSourceRead, state: State, localSequence: UInt32, remoteSequence: UInt32) {
+        init(flow: VPhoneTCPFlow, socket: Int32, readSource: DispatchSourceRead, state: State, localSequence: UInt32, remoteSequence: UInt32, peerMSS: Int) {
             self.flow = flow
             self.socket = socket
             self.readSource = readSource
             self.state = state
             self.localSequence = localSequence
             self.remoteSequence = remoteSequence
+            self.peerMSS = peerMSS
         }
     }
 
@@ -244,6 +258,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             localSequence: nextSequence(),
             // A SYN occupies one sequence number.
             remoteSequence: segment.sequenceNumber &+ 1,
+            peerMSS: segment.maximumSegmentSize ?? Self.defaultPeerMSS,
         )
         readSource.setEventHandler { [weak self] in self?.drainHost(connection) }
         // Qualified: the type has its own `close` for tearing a connection down.
@@ -272,6 +287,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
 
         readSource.resume()
         connections[flow.key] = connection
+        Self.log.debug("connect \(flow.destinationAddress):\(flow.destinationPort) from :\(flow.sourcePort)")
     }
 
     private func finishConnect(_ connection: Connection) {
@@ -377,15 +393,25 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             if received > 0 {
                 connection.lastActivity = Date()
                 let payload = Array(buffer[0 ..< received])
-                send(.init(
-                    sourcePort: connection.flow.destinationPort,
-                    destinationPort: connection.flow.sourcePort,
-                    sequenceNumber: connection.localSequence,
-                    acknowledgmentNumber: connection.remoteSequence,
-                    flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.psh,
-                    windowSize: Self.advertisedWindow,
-                    payload: payload,
-                ), connection: connection)
+                // A single segment may not exceed what the guest said it can
+                // take. Without this the segment runs past the MTU and the guest
+                // drops it silently -- which is what made small responses (the
+                // activation handshake) work and anything larger appear to hang.
+                var offset = 0
+                while offset < payload.count {
+                    let end = min(offset + connection.peerMSS, payload.count)
+                    send(.init(
+                        sourcePort: connection.flow.destinationPort,
+                        destinationPort: connection.flow.sourcePort,
+                        sequenceNumber: connection.localSequence,
+                        acknowledgmentNumber: connection.remoteSequence,
+                        flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.psh,
+                        windowSize: Self.advertisedWindow,
+                        payload: Array(payload[offset ..< end]),
+                    ), connection: connection)
+                    offset = end
+                }
+                Self.log.debug("host -> guest \(received)B in \(payload.count / max(connection.peerMSS, 1) + 1) segment(s)")
                 continue
             }
             if received == 0 {
@@ -427,7 +453,9 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             acknowledgmentNumber: connection.remoteSequence,
             flags: VPhoneTCPFlags.syn | VPhoneTCPFlags.ack,
             windowSize: Self.advertisedWindow,
+            advertisedMSS: Self.ourMSS,
         ), connection: connection)
+        Self.log.debug("handshake: SYN-ACK out, guest MSS \(connection.peerMSS)")
     }
 
     private func sendAcknowledgment(_ connection: Connection) {
@@ -467,6 +495,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     }
 
     private func finish(_ connection: Connection) {
+        Self.log.debug("close \(connection.flow.destinationAddress):\(connection.flow.destinationPort) from :\(connection.flow.sourcePort)")
         close(connection)
         connections[connection.flow.key] = nil
     }

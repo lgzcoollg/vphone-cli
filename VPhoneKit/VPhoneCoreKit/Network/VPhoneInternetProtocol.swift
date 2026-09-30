@@ -278,6 +278,15 @@ struct VPhoneTCPSegment {
     var flags: UInt8
     var windowSize: UInt16
     var payload: [UInt8]
+    /// The peer's maximum segment size, when its SYN carried option 2.
+    ///
+    /// Not optional by accident: without it we have to assume RFC 1122's default
+    /// of 536, which is safe but slow. With it we know how large a segment the
+    /// guest will accept, which is the whole reason this stack can send anything
+    /// larger than one MTU at a time.
+    var maximumSegmentSize: Int?
+    /// Our own MSS, advertised on SYN-ACK. Set when we build the handshake.
+    var advertisedMSS: Int?
 
     init(
         sourcePort: UInt16,
@@ -287,6 +296,8 @@ struct VPhoneTCPSegment {
         flags: UInt8,
         windowSize: UInt16,
         payload: [UInt8] = [],
+        maximumSegmentSize: Int? = nil,
+        advertisedMSS: Int? = nil,
     ) {
         self.sourcePort = sourcePort
         self.destinationPort = destinationPort
@@ -295,6 +306,8 @@ struct VPhoneTCPSegment {
         self.flags = flags
         self.windowSize = windowSize
         self.payload = payload
+        self.maximumSegmentSize = maximumSegmentSize
+        self.advertisedMSS = advertisedMSS
     }
 
     var hasSYN: Bool { flags & VPhoneTCPFlags.syn != 0 }
@@ -309,6 +322,13 @@ struct VPhoneTCPSegment {
     }
 
     func bytes(source: VPhoneIPv4Address, destination: VPhoneIPv4Address) -> [UInt8] {
+        // Option 2 (maximum segment size) is the only option we emit, and only
+        // when asked. Four bytes keeps the header on a 32-bit boundary.
+        var options: [UInt8] = []
+        if let advertisedMSS {
+            options = [2, 4, UInt8(truncatingIfNeeded: advertisedMSS >> 8), UInt8(truncatingIfNeeded: advertisedMSS)]
+        }
+        let headerLength = 20 + options.count
         var header: [UInt8] = [
             UInt8(sourcePort >> 8), UInt8(truncatingIfNeeded: sourcePort),
             UInt8(destinationPort >> 8), UInt8(truncatingIfNeeded: destinationPort),
@@ -316,12 +336,13 @@ struct VPhoneTCPSegment {
             UInt8(truncatingIfNeeded: sequenceNumber >> 8), UInt8(truncatingIfNeeded: sequenceNumber),
             UInt8(truncatingIfNeeded: acknowledgmentNumber >> 24), UInt8(truncatingIfNeeded: acknowledgmentNumber >> 16),
             UInt8(truncatingIfNeeded: acknowledgmentNumber >> 8), UInt8(truncatingIfNeeded: acknowledgmentNumber),
-            5 << 4, // data offset: five 32-bit words, no options
+            UInt8(headerLength / 4) << 4, // data offset, in 32-bit words
             flags,
             UInt8(windowSize >> 8), UInt8(truncatingIfNeeded: windowSize),
             0, 0, // checksum
             0, 0, // urgent pointer
         ]
+        header += options
         let whole = header + payload
         let sum = VPhoneInternetChecksum.compute(
             whole,
@@ -345,5 +366,28 @@ struct VPhoneTCPSegment {
         flags = bytes[13]
         windowSize = UInt16(bytes[14]) << 8 | UInt16(bytes[15])
         payload = Array(bytes[headerLength...])
+        maximumSegmentSize = Self.mss(inOptions: Array(bytes[20 ..< headerLength]))
+    }
+
+    /// The MSS a peer offered, if any.
+    ///
+    /// Option 2 carries its length in the second byte. A malformed option list
+    /// ends the walk rather than guessing: a peer that sends a broken one gets
+    /// the RFC 1122 default instead of a wrong number.
+    private static func mss(inOptions options: [UInt8]) -> Int? {
+        var index = 0
+        while index < options.count {
+            let kind = options[index]
+            if kind == 0 { return nil } // end of options
+            if kind == 1 { index += 1; continue } // no-op padding
+            guard index + 1 < options.count else { return nil }
+            let length = Int(options[index + 1])
+            guard length >= 2, index + length <= options.count else { return nil }
+            if kind == 2, length == 4 {
+                return Int(UInt16(options[index + 2]) << 8 | UInt16(options[index + 3]))
+            }
+            index += length
+        }
+        return nil
     }
 }
