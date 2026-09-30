@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/owngoal-dev/icli.git",
       "state" : {
-        "revision" : "74843a56df54936c3949239a4ffb3ddcbe37dee4",
-        "version" : "0.6.9"
+        "revision" : "ce271e5c9a70a5cb09005dd9d1c307d2f243426d",
+        "version" : "0.7.4"
       }
     },
     {
@@ -51,8 +51,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/Lakr233/libghostty-spm.git",
       "state" : {
-        "revision" : "b7f888e3baf8585ea9d590ab1a45b49475e00d1c",
-        "version" : "1.6.20260922"
+        "revision" : "5a025555f0a85ee51da7eb306c35f660d116e879",
+        "version" : "1.6.20260928"
       }
     },
     {

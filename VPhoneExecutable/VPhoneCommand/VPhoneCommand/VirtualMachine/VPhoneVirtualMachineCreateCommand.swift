@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import VPhoneCoreKit
+import VPhonePatchKit
 
 struct VPhoneVirtualMachineCreateCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
@@ -15,20 +16,22 @@ struct VPhoneVirtualMachineCreateCommand: ParsableCommand {
     @Option(name: .shortAndLong, help: "cloudOS IPSW URL or local path") var cloudosSource: String?
     @Option(help: "GPU driver bundle from the same cloudOS build, for offline AEA recovery")
     var gpuDriverBundle: String?
+    @Option(help: "Directory for downloaded IPSWs, shared by every VM (default: ~/.vphone/ipsws or $VPHONE_ROOT/ipsws)")
+    var ipswCache: String?
     @Option(name: .shortAndLong, help: "Disk size (GB)") var diskSize: UInt64 = 64
     @Flag(
         name: .customLong("force-dsc-maxslide"),
         help: "Zero the dyld cache maxSlide on non-27 bases (opt-in DSC-map fit)",
     )
     var forceDyldSharedCacheMaxSlide = false
-    @Flag(
-        name: .customLong("frida"),
-        help: "Opt in to Frida Stalker kernel relaxations",
+    @Option(
+        name: .customLong("preset"),
+        help: "Patch preset for the new VM. Defaults to standard; run `fw patches` to see what each one applies.",
     )
-    var frida = false
+    var preset: String = VPhonePatchPreset.standardIdentifier
     @Flag(
         name: .customLong("keep-artifacts"),
-        help: "Keep the prepared restore tree after installation. Source IPSWs are always kept.",
+        help: "Keep the prepared restore tree after installation. Downloaded IPSWs always stay in the IPSW cache.",
     )
     var keepArtifacts = false
     @Flag(name: .customShort("v"), help: "Increase verbosity: -v tool detail, -vv guest serial, -vvv internal trace")
@@ -55,8 +58,11 @@ struct VPhoneVirtualMachineCreateCommand: ParsableCommand {
             iphoneSource: sources.iphoneSource,
             cloudosSource: sources.cloudosSource,
             gpuDriverBundle: gpuDriverBundle.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) },
+            ipswCacheDirectory: ipswCache.map {
+                URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath, isDirectory: true)
+            } ?? VPhoneResources.ipswCacheDirectory(),
             forceDyldSharedCacheMaxSlide: forceDyldSharedCacheMaxSlide,
-            enableFrida: frida,
+            patchPreset: preset,
             diskSizeGB: diskSize,
             verbosity: VPhoneVerbosity(count: verboseCount),
             keepArtifacts: keepArtifacts,

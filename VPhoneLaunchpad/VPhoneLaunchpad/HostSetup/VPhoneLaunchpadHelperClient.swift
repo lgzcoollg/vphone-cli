@@ -25,6 +25,10 @@ final class VPhoneLaunchpadHelperClient {
 
     private nonisolated static let label = VPhoneLaunchpadHelperIdentity.label
 
+    init() {
+        state = installedState()
+    }
+
     // MARK: - Status
 
     /// CFBundleVersion of the helper embedded in this app.
@@ -61,22 +65,35 @@ final class VPhoneLaunchpadHelperClient {
         return !helperRequirement.contains("subject.OU] = \"\"")
     }
 
-    func refresh() async {
+    /// What the files on disk say, without asking the helper. A helper
+    /// identical to the embedded copy counts as ready until XPC says
+    /// otherwise, so launch shows it installed straight away.
+    private func installedState() -> State {
         guard isConfigured else {
-            state = .unconfigured
-            return
+            return .unconfigured
         }
         let hasJob = FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/\(Self.label).plist")
         let hasExecutable = FileManager.default.fileExists(atPath: installedHelper.path)
         guard hasJob || hasExecutable else {
-            state = .notInstalled
-            return
+            return .notInstalled
         }
         let bundled = bundledVersion ?? "?"
         guard hasJob, hasExecutable else {
-            state = .outdated(installed: "unknown", bundled: bundled)
-            return
+            return .outdated(installed: "unknown", bundled: bundled)
         }
+        return installedHelperMatches ? .ready(bundled) : .unknown
+    }
+
+    func refresh() async {
+        let installed = installedState()
+        switch installed {
+        case .unconfigured, .notInstalled, .outdated:
+            state = installed
+            return
+        case .unknown, .ready:
+            break
+        }
+        let bundled = bundledVersion ?? "?"
         do {
             let installed = try await version()
             state = installed == bundled && installedHelperMatches
@@ -281,7 +298,10 @@ final class VPhoneLaunchpadHelperClient {
         if let helperRequirement {
             connection.setCodeSigningRequirement(helperRequirement)
         }
-        connection.invalidationHandler = { [weak self] in
+        // XPC calls this and the error handlers below on its own queue. Without
+        // @Sendable they would inherit the main actor, and Swift 6 traps when
+        // they run there.
+        connection.invalidationHandler = { @Sendable [weak self] in
             Task { @MainActor in self?.connection = nil }
         }
         connection.resume()
@@ -296,7 +316,7 @@ final class VPhoneLaunchpadHelperClient {
         let connection = currentConnection()
         return try await withCheckedThrowingContinuation { continuation in
             let once = VPhoneLaunchpadResumeOnce(continuation)
-            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+            let proxy = connection.remoteObjectProxyWithErrorHandler { @Sendable error in
                 once.resume(.failure(error))
             }
             guard let helper = proxy as? VPhoneLaunchpadHelperProtocol else {
@@ -323,7 +343,7 @@ final class VPhoneLaunchpadHelperClient {
         let connection = currentConnection()
         return try await withCheckedThrowingContinuation { continuation in
             let once = VPhoneLaunchpadResumeOnce(continuation)
-            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+            let proxy = connection.remoteObjectProxyWithErrorHandler { @Sendable error in
                 once.resume(.failure(error))
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {

@@ -70,20 +70,32 @@ nonisolated struct VPhoneLaunchpadBundleReceipt: Codable, Equatable, Sendable {
 /// checks them to give an early message; the helper checks them because it
 /// must not trust the app.
 nonisolated enum VPhoneLaunchpadNames {
-    static let minimumBundleVersion = "2.0.8"
+    static let minimumBundleVersion = "2.1.0"
 
     static func isValidVersion(_ value: String) -> Bool {
         matches(value, "^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$") && !value.contains("..")
     }
 
+    /// The bundle's own version inside a store name. Builds that are not
+    /// releases carry a suffix: `-local` for one made on this Mac, and
+    /// `-ci.<commit>` for a GitHub Actions artifact.
+    static func bundleVersion(of value: String) -> String {
+        if value.hasSuffix("-local") {
+            return String(value.dropLast("-local".count))
+        }
+        if let suffix = value.range(of: "-ci\\.[0-9a-f]{7,40}$", options: .regularExpression) {
+            return String(value[..<suffix.lowerBound])
+        }
+        return value
+    }
+
     static func isCompatibleBundleVersion(_ value: String) -> Bool {
         guard isValidVersion(value) else { return false }
-        let release = value.hasSuffix("-local") ? String(value.dropLast("-local".count)) : value
-        let parts = release.split(separator: ".", omittingEmptySubsequences: false)
+        let parts = bundleVersion(of: value).split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 3,
               let major = Int(parts[0]), let minor = Int(parts[1]), let patch = Int(parts[2])
         else { return false }
-        return (major, minor, patch) >= (2, 0, 8)
+        return (major, minor, patch) >= (2, 1, 0)
     }
 
     static func isValidMachineName(_ value: String) -> Bool {

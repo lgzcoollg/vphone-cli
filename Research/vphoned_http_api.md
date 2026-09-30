@@ -95,7 +95,7 @@ An optional `package_path` selects a guest-uploaded Irisin `.deb` instead.
 The path must be `/var/root/Library/Caches/vphoned-irisin-<UUID>.deb`; vphoned
 opens it without following symlinks, requires a regular file of at most 64 MiB,
 and validates the Debian package name, architecture, app version, executables,
-and launchd plist before installing. The Guest menu's Option alternate opens
+and launchd plist before installing. The Apps menu's Option alternate opens
 a file picker, uploads the selected package, and chooses the layout. The default
 menu item retains the verified latest-release download.
 Rootless uses `/var/jb`. RootHide reuses the sole valid `.jbroot-<16 hex>` under
@@ -127,11 +127,14 @@ the `.jbroot` loader links in the bootstrap root and standard executable and
 library directories. On startup it repairs missing links for an existing
 completed installation without replacing links that point elsewhere. These
 links let `@loader_path/.jbroot/usr/lib/...` dependencies resolve when a
-package manager later installs tools such as `dash`.
+package manager later installs tools such as `dash`. It then links every
+bootstrap directory that holds a Mach-O file, and repeats that walk one
+second after the root's `Library/dpkg` changes, so a package installed later
+by Irisin, apt or dpkg is linked without a reboot.
 The launchd and SystemHook spawn bridges also create a missing `.jbroot`
-beside a bootstrap executable just before it starts, covering applications
-installed after the initial bootstrap. The fixed links remain necessary for
-jobs whose launch path does not pass through either observed spawn bridge.
+beside a bootstrap executable and its in-root dependencies just before it
+starts, when the spawning process may write there. See
+`Research/roothide_loader_links.md`.
 `POST /v1/bootstrap/firmware` (RPC `bootstrap.firmware`)
 repairs the record for a bootstrap already identified by the completion marker
 without running another install. The reply includes the tag,
@@ -162,9 +165,9 @@ are both removed. The daemon rejects a changed path and symlinked child
 directories. It unloads each bootstrap's launch daemons, unregisters its apps,
 deletes both rootless and RootHide roots, marks the completion record uninstalled,
 then schedules a full guest reboot. `"reboot":false` skips the reboot; holding
-Option on the Guest menu's uninstall item selects this mode. If cleanup fails, the
+Option on the Apps menu's uninstall item selects this mode. If cleanup fails, the
 installed record remains so the operation can be retried. Irisin's mobile
-Documents data outside the bootstrap is retained. Guest > Uninstall Bootstrap…
+Documents data outside the bootstrap is retained. Apps > Uninstall Bootstrap…
 shows every path in a destructive confirmation alert before sending the request.
 
 ## HTTP and WebSocket contract
@@ -228,7 +231,7 @@ correlate them by `id`. The socket also sends
 receive pong frames. JSON WebSocket frames are limited to 1 MiB after
 fragment reassembly.
 
-SwiftNIO handles parsing, upgrade, masking, and backpressure. IcliKit 0.6.8
+SwiftNIO handles parsing, upgrade, masking, and backpressure. IcliKit 0.7.0
 owns general device operations. Each HTTP or WebSocket request runs independently
 on a concurrent worker queue, so a stalled system service does not block HID,
 file browsing, or unrelated requests. The host serializes the input events it
@@ -267,12 +270,13 @@ request carries `"force": true`.
 | Area | Methods |
 | --- | --- |
 | Device | `device.snapshot`, `device.info` (snapshot plus network, screen, rotation, brightness, volume, low power, Developer Mode, agent), `device.screen`, `device.network`, `device.ioreg {plane}`, `device.environment`, `device.basebin {archive?}` |
-| Display, audio | `display.brightness {value?}`, `display.rotation {orientation?}`, `display.rotation_lock {locked}`, `audio.volume {value?, category?}`, `audio.state` |
+| Display, audio | `display.brightness {value?}`, `display.rotation {orientation?}`, `display.orientation` (`{degrees, source}`: SpringBoard's interface orientation without a screen capture, for polling; capability `display_orientation`), `display.rotation_lock {locked}`, `audio.volume {value?, category?}`, `audio.state` |
 | Input | `input.touch`, `input.hid`, `input.button {name}`, `input.key {name}`, `input.type {text, delay_ms?}`, `input.paste {text}`, `input.tap`, `input.double_tap`, `input.long_press`, `input.swipe`, `input.drag {points}`, `input.touch_sequence {events}` — gesture coordinates are screen points |
 | UI | `ui.tree` (alias `accessibility.tree`), `ui.element_at`, `ui.tap_element`, `ui.wait`, `ui.wait_gone`, `ui.ocr {languages?, min_confidence?}`, `ui.describe`, `screen.screenshot` |
 | Processes | `processes.list {filter?}`, `processes.kill {pid, signal?}` **force**, `memory.jetsam`, `memory.pressure` (only the three kernel memory sysctls, for polling) |
 | launchd | `services.list`, `status`, `print`, `dump`, `disabled`, `start`, `enable`, `load`; `services.stop`, `disable`, `remove`, `signal`, `unload` **force**; `launchd.getenv`, `setenv`, `unsetenv` |
 | Logs | `logs.syslog {seconds, process?, level?, max_lines?}` (a bounded capture of at most 60 s), `logs.crashes {bundle_id?}`, `logs.crash {path}` |
+| Darwin notifications | `notify.post {name, state?}` (`postDarwinNotification`; `state` is a UInt64, as a number or a decimal string, stored before the post), `notify.state {name}` (`darwinNotificationState`) |
 | Network, security | `network.capture {seconds, interface?, filter?}` (writes a pcap in the guest scratch directory and returns its path), `security.ssl_killswitch` |
 | Apps | `apps.list`, `search`, `refresh`, `launch`, `terminate`, `foreground`, `open_url`, `install`, `info`, `binary`, `data_dir`, `url_schemes`, `handlers`, `registration`, `register`, `network_policy {repair?}`; `apps.uninstall`, `unregister`, `unregister_dir` **force** |
 | System | `system.uicache`, `system.system_apps {visible?}`, `system.respring` **force**, `system.reboot {userspace?}` **force**, `developer_mode.status`, `developer_mode.enable`, `power.low_power_mode`, `diagnostics.self_test` |
@@ -296,13 +300,12 @@ icli's own error `code` (`failed`, `unavailable`, `device_locked`, …) and
 message.
 
 The environment update keeps `launchdhook-vphone.dylib`,
-`SystemHook-vphone.dylib`, `libvcamcaptured.dylib`, `libcamfix.dylib`, and
-`libvlocation.dylib` in
+`SystemHook-vphone.dylib`, `libvcamcaptured.dylib` and `libcamfix.dylib` in
 `/usr/lib` in step with the host bundle. After each connection the VM
 process compares the guest's hashes with `Contents/Resources/guest-resources`,
 uploads the libraries that differ to the staging directory
 (`/var/root/Library/Caches/vphone-environment`) and calls
-`environment.install`. vphoned accepts only those five names and checks each
+`environment.install`. vphoned accepts only those four names and checks each
 SHA-256. When `/` is mounted read-only it runs `/sbin/mount -u -w /`, copies
 each library beside its destination, renames it into place with mode 0755
 and owner root, and tries `/sbin/mount -u -r /` again. An APFS guest can reject
@@ -314,14 +317,27 @@ camera client loads the new hook. The result lists `installed`,
 `restarted_pids` and `reboot_required`, which is true when the launchd hook
 changed: launchd keeps the copy it mapped at boot.
 
-`location.set` publishes the validated coordinate atomically to
-`/var/mobile/Library/Caches/vphone-location.json`. The app hook reads that file
-and delivers updates to authorized `CLLocationManager` clients, including Maps;
-`location.clear` removes it. The system simulation request remains best effort
-because iOS 26.4's location fusion may reject it. `location.current` reports
-`delivery: application_override` when the state file exists; it reports the
-published coordinate, not independent confirmation from each app. Newly
-installed hooks require app relaunch before that app receives overrides.
+`location.set` is IcliKit's `simulateLocation`: it sends locationd's
+`CLSimulationManager` the sequence Xcode uses (`stopLocationSimulation`,
+`clearSimulatedLocations`, `appendSimulatedLocation:`, `flush`,
+`startLocationSimulation`). locationd sends no reply and silently ignores a
+client without `com.apple.locationd.simulation`, so success is decided by a
+read-back: vphoned opens a `CLLocationManager` with
+`initWithEffectiveBundlePath:` on the first authorized System Services bundle
+(`SystemCustomization`, `TimeZone`, `CompassCalibration`), then waits up to 5 s
+for a fix stamped no earlier than one second before the read, within 1e-7° of
+the requested coordinate. The fix must be `fresh` and
+`sourceInformation.isSimulatedBySoftware`; otherwise vphoned clears the
+simulation and returns `unavailable` (`no location within 5 s`, or `locationd
+did not apply the simulated location`). The reply is `simulating: true` plus
+the fix that was read back. `location.clear` stops the simulation and polls for
+up to 6 s until locationd stops reporting a fresh simulated fix.
+`location.current` reads the same way with the caller's timeout and reports
+`fresh` and `simulated` as CoreLocation gives them. The read-back needs
+locationd to deliver a fused fix. The 2.0.4 guest in
+`Research/Guest/location_simulation_26_4_failure.md` never got one; that build
+had the hv_vmm_present concealment on, under which bluetoothd crash-loops and
+locationd blocks on it (issue #438). `standard` no longer enables it.
 
 ## Connection failure behavior
 
@@ -329,9 +345,17 @@ A dropped HTTP or WebSocket connection closes only that request channel. The
 guest launchd plist starts a small vphoned proxy. It uses `posix_spawn` to
 start the same signed executable with `--io`, then waits for and reaps that
 worker. The worker owns VSOCK 1338 and 1339 and all API state. The proxy
-restarts an unexpectedly exited worker with bounded backoff, and forwards
-shutdown to it. A pipe makes the worker exit if launchd kills the proxy, so
-the old worker cannot retain the ports after launchd starts a replacement.
+restarts an unexpectedly exited worker after a fixed one-second pause, for
+as long as it runs, and forwards shutdown to it. The previous exponential
+backoff kept a 26.4 guest's API down until about 24 s after launchd started
+the proxy: early-boot workers exited, and the proxy waited 1, 2, 4 and 8 s
+between them. The proxy logs each worker exit with its status or signal to
+`/var/log/vphoned.log`, which the plist names as stdout and stderr. The plist
+also sets `ThrottleInterval` to 1 so launchd restarts the proxy itself one
+second after it exits, not the default ten, and `ProcessType` to
+`Interactive` so boot-time CPU and I/O throttling does not apply. A pipe
+makes the worker exit if launchd kills the proxy, so the old worker cannot
+retain the ports after launchd starts a replacement.
 The proxy never initializes NIO, IcliKit, or the camera server under its
 6 MB per-process Jetsam limit. A successful `agent.apply_update` worker exit
 makes the proxy exit so launchd can restart the updated cached binary. If a

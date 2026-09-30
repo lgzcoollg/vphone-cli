@@ -1,15 +1,136 @@
 # Patch Comparison: Regular / Development / Jailbreak / Experimental
 
+> **Patch sets and presets (2026-09-28):** every patch is now *declared*, and
+> selection happens before any byte is written. The declarations live in nine
+> bundled patch sets under `VPhoneExecutable/VPhoneCommand/FirmwarePatcher/PatchSets/`
+> (`bootchain`, `kernel.base`, `kernel.jailbreak`, `kernel.hypervisor`,
+> `kernel.frida`, `devicetree`, `guest.system`, `guest.display`,
+> `guest.identity`), listed by `FirmwarePatchSetCatalog`. A declaration's
+> identifier is the record identifier the patcher already emits, or the common
+> prefix when one patch writes several sites — so `jb.kcall10` is one selectable
+> patch covering its four records, and `sandbox_ext` covers every
+> `sandbox_ext_<index>`. 116 patches are declared in total. `vphone-cli fw patches`
+> prints them; `--json` is what the Launchpad patch editor reads.
+>
+> Two presets ship, prewritten, in
+> `VPhone.bundle/Contents/Resources/patches_presets/`. Both name all nine sets and
+> differ only in their selection: `standard` (the default, and what a VM gets
+> unless `--preset` says otherwise) blocks the two Frida Stalker relaxations, the
+> three `hv_vmm_present` concealment patches, and the iPhone17,3 identity rewrites;
+> `extended` blocks nothing.
+>
+> **Only the camera remains of EXP by default (2026-09-28).** `standard` is now the
+> JB baseline plus the virtual camera. Off by default, besides the concealment
+> below: `watchdogd.hv_vmm_cache` (moved into
+> `FirmwarePatchSetCatalog.hypervisorConcealmentPatches`, and no longer
+> `bootEssential` — watchdogd only panics once the OID is renamed), the eight
+> DeviceTree identity rewrites (`devicetree.target_sub_type`,
+> `compatible_secondary`, `product.fdr_product_type`, `product.sub_product_type`,
+> `product.unique_model`, `product.gestalt_variants_rename`,
+> `arm_io.device_type`, `arm_io.soc_generation`), and the post-restore Preboot
+> DeviceTree rewrite, now declared as `preboot_devicetree.identity`
+> (`.prebootDeviceTree`, Guest Identity set). Until now that rewrite was undeclared
+> and `cfw install` ran it on every VM; it now asks the plan first, and a VM with
+> no plan still gets it. The last two groups are
+> `FirmwarePatchSetCatalog.experimentalIdentityPatches`. Still on: the four board
+> presentation properties, camera offsets, the camera / FaceTime / audio / IOPM /
+> SMC / ISP nodes, and `camera_dsc`. Camera support reads `/product/camera`
+> through MobileGestalt and does not depend on the identity rewrites. Issue #438
+> (no location with EXP) is the reason. The `libvlocation.dylib` app hook that
+> worked around it is removed, and `location.*` is back on IcliKit's locationd
+> simulation with read-back. The Preboot DeviceTree comes from restore, so a VM
+> restored with the identity on keeps it until it is restored again.
+>
+> **`hv_vmm_present` concealment is opt-in as of 2026-09-28, and it is not a
+> preference.** `kernelcache_exp.hv_vmm` (the kernel OID rename plus the
+> kernel-internal cstring mangle) and `hv_vmm_dsc` (the shared-cache mangle the JB
+> system installer runs) were made default-on by commit 228326d; on a freshly
+> restored 26.4 guest they are a brick. `bluetoothd` on 23E246 caches its
+> `sysctlbyname("kern.hv_vmm_present")` answer in a `dispatch_once`, gets ENOENT and
+> caches 0, and its chip-selection singleton then picks a transport from
+> `MGIsDeviceOneOfType` — nothing matches a virtual iPhone, the singleton stays
+> NULL, and it faults and crash-loops until launchd throttles it. `locationd` blocks
+> on a synchronous call to the throttled Bluetooth XPC service, the
+> `com.apple.locationd.migrator` datamigrator plugin hangs, and SpringBoard waits on
+> migration: black screen, no panic. The addresses and the full chain are in
+> `Research/Patches/hv_vmm_present_usermode_xrefs.md` (B.3 correction).
+>
+> Neither half is useful alone — the rename without the cache mangle breaks the
+> graphics and ML paths, the mangle without the rename does nothing — so they are
+> declared as a pair, `FirmwarePatchSetCatalog.hypervisorConcealmentPatches`, and a
+> catalogue test refuses a shipped preset that enables one without the other. Both
+> lost `bootEssential`, which they never were: a shipped preset that drops a
+> boot-essential patch warns on every run. (The other former EXP patches stayed on
+> in this first change; the note above turns everything but the camera off.) A VM
+> records only the boxes its owner changed, in
+> `<vm>/PatchSelection.plist`, and `fw patch` writes what it resolved to
+> `<vm>/PatchPlan.plist` for `cfw install` to reuse.
+>
+> **Patch sets also load from outside the bundle.** A `.vphonepatchset` is a macOS
+> loadable bundle whose `Contents/Resources/Manifest.plist` is read before any of
+> its code is mapped, and whose executable exports one symbol,
+> `vphone_patch_set_principal`, returning a `VPhonePatchSetPrincipal` that hands the
+> pipeline one `BufferedPatcher` per component the plan enabled. Not
+> `NSPrincipalClass`: PatchKit is built for library evolution, so a subclass of a
+> PatchKit class is registered with the ObjC runtime only when its metadata is first
+> realized, and `Bundle.principalClass` therefore resolves to the wrong class
+> entirely. `VPhoneExecutable/VPhoneCommand/VPhonePatchSetExample` is the template
+> and is what the loader tests load.
+>
+> An external set can patch the boot chain only, and reaches a run through a preset
+> in `~/.vphone/patches_presets/` naming it by identifier *and* path — the manifest
+> at that path has to declare that identifier. `vphone-cli patchset import` copies a
+> set into `~/.vphone/patchsets` and ad hoc signs it, which is what makes a bundle
+> straight out of Xcode loadable at all: the linker signs the Mach-O but seals no
+> resources, so `codesign --verify` rejects it until one `codesign --force --sign -`
+> pass over the bundle fixes it. The signature is re-verified from disk at every
+> load. Root `cfw install` loads no external set, so nothing here is on a privileged
+> path.
+>
+> **Version gates replaced three flags.** The patches `--frida`,
+> `--force-exc-guard` and `--force-dsc-maxslide` controlled now carry a structured
+> `VPhonePatchApplicability`: `kernel.thread_guard_violation` is pinned to
+> `iOSBase: .major(18)` (whose runningboardd trips a flavor-10 Mach port guard and
+> crash-loops the UI), `dsc_maxslide.zero` to `.major(27)`, and the two
+> `kernelcache_frida.*` patches to `cloudOS: .atLeast(26, 4)`. A preset can turn a
+> patch off, and a VM can turn one on that its preset leaves off, but neither can
+> widen a version gate — so forcing the guard or the slide onto a 26.x base is no
+> longer possible. That capability was opt-in for third-party RASP SDKs and was
+> never required to boot.
+>
+> Two of the three flags are gone from the surface as well: `--force-exc-guard` no
+> longer exists, and `--frida` survives only on the `patch-component` developer
+> subcommand, not on `vm create` or `fw patch`. `--force-dsc-maxslide` is **still
+> plumbed** through `vm create`, `VPhoneVirtualMachineCreateOptions`, the Launchpad
+> helper protocol and the Launchpad new-machine sheet, where it now reaches an
+> installer branch the plan has already decided; removing that chain is outstanding
+> and touches the privileged helper's XPC signature, so it is its own change.
+>
+> The `iosBaseIs18` / `iosBaseIs27` booleans are gone from the pipeline too: it now
+> carries a parsed `VPhoneVersion` (major, minor, patch). Two things still branch
+> on the release rather than on a selection, because they change *which shapes a
+> patch looks for* rather than whether it runs: the 18.x skywalk-netagent
+> boot-arg, and `KernelJailbreakPatcher.applyIOS27`.
+>
+> **Byte-identity check (2026-09-28):** the golden corpus was re-run over cloudOS
+> 26.4 with iOS 26.1, 26.4 and 27.0 bases. `--preset standard` reproduced the
+> pre-patch-set output for all three, digest for digest, and `--preset extended`
+> reproduced the old `--frida` case exactly. No run emitted the
+> `declared by no patch set` warning, so every record the boot chain emits is
+> covered by a declaration. The one case that no longer exists is
+> `--force-exc-guard` on a 26.1 base, for the reason above.
+
 > **Current product scope (September 2026):** the tables below preserve the
 > historical patch comparison. The public runtime now exposes only JB. Guest
 > package managers, Procursus, and first-boot package setup are outside this
 > repository. The native Swift JB install retains the base system patches,
 > launchd jetsam guard, debugserver entitlement edit, iOS 27 Campo entitlement
 > edit, GPU driver, mandatory vphoned, and the small vphone launchd hook described
-> below. The JB firmware pipeline now also runs the former EXP kernel OID and
-> DeviceTree identity/camera patches. The JB system installer runs the former
-> EXP DSC hypervisor and camera patches, watchdogd patch, and post-restore
-> Preboot DeviceTree rewrite. `SPOOF_BUILD` remains opt-in and updates the
+> below. The JB firmware pipeline also runs the former EXP DeviceTree
+> identity/camera patches. The JB system installer runs the former EXP DSC camera
+> patch, watchdogd patch, and post-restore Preboot DeviceTree rewrite. The former
+> EXP kernel OID rename and its DSC half are the exception: declared, but off in
+> `standard` since 2026-09-28 for the reason in the note above. `SPOOF_BUILD` remains opt-in and updates the
 > rootfs and installed SystemOS SystemVersion.plist copies, plus the Preboot
 > Cryptex copy when present. These are install-time integrations;
 > successful patch dry-runs do not establish guest boot or Camera.app behavior.
@@ -45,21 +166,20 @@
 > `cfw install` now places `launchdhook-vphone.dylib` and a diagnostic
 > `SystemHook-vphone.dylib` in `/usr/lib`, links `/vh` to the launchd hook,
 > inserts a weak `/vh` load command for the
-> launchd hook after `patch-launchd-jetsam`, and re-signs launchd. The hook
-> extends launchd's `Paths` and `LaunchDaemons` values with the selected
-> bootstrap's `Library/LaunchDaemons` (plus `basebin/LaunchDaemons` when present).
-> It reads each real plist from the bootstrap root but inserts it under a
-> distinct `/System/Library/LaunchDaemons/vphone.*.plist` cache key. On the
-> tested iOS 26.6.2 cache loader, otherwise identical entries keyed by
-> `/var/jb/Library/LaunchDaemons/...` or `/Library/LaunchDaemons/...` were
-> ignored; a System key was imported and its executable ran. The old binary
-> in `zqxwce/vphone-cli-storage` at `2ef6b06` uses the real `/var/jb` key
-> and `MSHookFunction` to intercept `xpc_dictionary_get_value`; it also
-> requires `/cores/systemhook.dylib` and `/cores/libellekit.dylib` at startup.
-> A single `.jbroot-<16 hex>` under the RootHide application container is
-> accepted; ambiguous roots are ignored. RootHide bootstrap-relative `Program`
-> and `ProgramArguments[0]` paths are translated to physical kernel paths in
-> the in-memory XPC plist. The hook also tries to remove PID 1's existing
+> launchd hook after `patch-launchd-jetsam`, and re-signs launchd. Until
+> 2026-09-29 the hook also extended launchd's `Paths` and `LaunchDaemons`
+> cache values with the bootstrap's `Library/LaunchDaemons`, under distinct
+> `/System/Library/LaunchDaemons/vphone.*.plist` keys (the tested iOS 26.6.2
+> cache loader ignored `/var/jb/...` and `/Library/...` keys). Those jobs did
+> not match the plist path a package script boots out, so the hook no longer
+> touches `xpc_dictionary_get_value`: vphoned loads the bootstrap's daemons
+> after boot, as RootHide's `jbctl startup` does (`Research/roothide_loader_links.md`).
+> The old binary in `zqxwce/vphone-cli-storage` at `2ef6b06` uses the real
+> `/var/jb` key and `MSHookFunction` to intercept `xpc_dictionary_get_value`;
+> it also requires `/cores/systemhook.dylib` and `/cores/libellekit.dylib` at
+> startup. The bootstrap root is `/var/jb` or the one RootHide root vphoned
+> installs, `.jbroot-000114514191980C`; spawns look for it until it appears.
+> The hook also tries to remove PID 1's existing
 > jetsam limit and suppresses future fatal task-limit assignments for PID 1.
 > The launchd hook interposes PID 1's `posix_spawn` without loading ElleKit,
 > so process injection remains available before a package manager installs it. It adds
@@ -308,7 +428,7 @@
 | JB-23 | B     | `patch_thid_should_crash`             | `_thid_should_crash`                                                                                 | Prevent GUARD_TYPE_MACH_PORT crash                                                                                                                                                   |     Y      |
 | JB-23b| B     | `patchThreadSetStateEntitlementFlag`  | `thread_set_state_from_user` / inlined `act_set_state_from_user` flags materialization               | **Frida Stalker existing-thread support (opt-in `--frida`).** Stalker updates an existing thread's core registers via `thread_set_state_from_user`, which passes `flags = TSSF_TRANSLATE_TO_USER \| TSSF_CHECK_ENTITLEMENT` (0x201) into `thread_set_state_internal`; the inlined `thread_set_state_allowed()` then demands `com.apple.private.thread-set-state` (which the target lacks) → `GUARD_TYPE_MACH_PORT / THREAD_SET_STATE`. Rather than NOP the entitlement check, clear TSSF_CHECK_ENTITLEMENT (bit 9) in the flags the user setters pass: rewrite `mov w6, #0x201` → `mov w6, #0x1`. This preserves TSSF_TRANSLATE_TO_USER (user-pointer translation) and leaves the independent `TH_IN_MACH_EXCEPTION` guard enforced — it only stops user-initiated `thread_set_state` from being entitlement-gated. Anchor: entitlement-string xref cluster → the single containing function (thread_set_state_internal); then its direct `b`/`bl` callers that set `w6` (the 7th-arg = flags, a calling-convention anchor, not an allocation guess) to 0x201. Both setters (`thread_set_state_from_user` + inlined `act_set_state_from_user`) are patched. No offsets/VAs/registers/bytes hardcoded; replacement from the Keystone-backed `ARM64Encoder.encodeMovzW`, Capstone-verified. Kernels without the shape are skipped (fail-open no-op). Verified on the `c0ecdb4b` 26.4 kernel (UUID `BCD06230-CCBE-8E48-50FF-D9C166D83CD5`): exactly two records at file-off `0x1D95720`/`0x1D9594C`. | `--frida` |
 | JB-24 | B     | `patch_vm_fault_enter_prepare`        | `_vm_fault_enter_prepare`                                                                            | Force `cs_bypass` fast path in runtime fault validation                                                                                                                              |     Y      |
-| JB-25 | B     | `patch_vm_map_protect`                | `_vm_map_protect`                                                                                    | Skip upstream write-downgrade gate. Shape A (26.1–26.4) active; **Shape B (26.5) disabled 2026-07-05** — widened the `~VM_PROT_WRITE` COW strip (vm_map.c:6202) instead of the RWX gate (vm_map.c:5997), breaking COW and crashing the debugger (SPTM `VIOLATION_ILLEGAL_MAP`). Retired on 26.5+: SPTM code-mod (debugger + Substrate tweaks) uses write-then-flip via `vm_protect(VM_PROT_COPY)` → `XNU_USER_DEBUG`, so no RWX patch is needed. **SHAPE C ADDED (2026-09-22, cloudOS 26.4 `c0ecdb4b…`, jb):** the patch logged `[-] vm_map_protect write-downgrade gate not found` on this base, which `make test_fw_patches` is built to fail on. Two independent causes, both confirmed by disassembling the 26.4 research kernelcache. **(1) The gate is compiled differently.** Where 26.1/26.3 emit a flag-setting `bics` plus a separate `tbnz wFlags,#22,skip`, 26.4 folds the two conditions into a conditional compare and leaves one branch: `and wFlags,wFlags,#0x400000` / `mov wMask,#6` / `bic wMask,wMask,wProt` / `cmp wMask,#0` / `ccmp wFlags,#0,#0,eq` / `b.ne skip`, with `and wProt,wProt,#0xfffffffb` (clear `VM_PROT_EXECUTE`, keep R|W) inside the guarded block. Same mask `#6`, same entry bit 22, same downgrade — rewriting that single `b.ne` to an unconditional `b` bypasses both conditions at once, exactly as Shape A's rewrite does (there the `tbnz` becomes dead). Observed at VA `0xFFFFFE0008DCAEA0` → `0xFFFFFE0008DCAED0` (file `0x1DC6EA0`). **(2) The search window stopped short.** `findFuncEnd` ends at the next `pacibsp`; on 26.4 the block holding the `"vm_map_protect("` panic string ends at its own prologue `0x6B8` bytes *before* the gate, so the window derived from the string anchor never reached it. **Reveal procedure for Shape C:** the signature is its own anchor rather than a byte window — across the whole `com.apple.kernel __TEXT_EXEC` (8.4 MB) even the bare `mov wMask,#6 ; bic wMask,wMask,wProt` prefix occurs **exactly once**, and the matcher additionally requires the bit-22 mask before it and the execute-clearing `and` inside the guarded block, then demands a unique hit across all code ranges. Widening by an offset was rejected as an offset-shaped anchor. **Backward compatibility:** Shape A is untouched and still tried first, so 26.1/26.3 take precisely the path they always took and Shape C is unreachable there. **VALIDATED on-device (2026-09-23, `17,3_26.4_23E246` + cloudOS 26.4 `23E5207q`, JB, `vm create` host-mount deploy):** the deployed `kernelcache.research.vphone600` carries the rewritten gate — `0xFFFFFE0008DCAEA0` disassembles as unconditional `b #0xfffffe0008dcaed0` with `and w8,w8,#0x400000 / mov w9,#6 / bic w9,w9,w20 / cmp w9,#0 / ccmp w8,#0,#0,eq` intact above it — and the VM boots clean: zero `panic(` / `stackshot` markers across the whole boot log, SpringBoard up, Safari and Sileo both running, so the JB userland and TweakLoader come up with the patch live. The gate is the same one on a 26.4 base whichever userland rides on top, since `fw_patch_jb` patches the cloudOS kernelcache, not the iOS one. Matching was separately checked on `17,3_27.0_24A435` + the same base. **Still not exercised:** a debugger attach or a tweak RWX write specifically — that is the failure mode Shape B produced (broken COW, SPTM `VIOLATION_ILLEGAL_MAP`), and a clean boot with Sileo running is good evidence but not that test. Note the source also disagreed with itself about the covered range — headers said "Shape A (26.1 / 26.3)", line 69 said "26.1-26.4"; on 26.4 the answer is neither, it is Shape C. |    Y/N     |
+| JB-25 | B     | `patch_vm_map_protect`                | `_vm_map_protect`                                                                                    | Skip upstream write-downgrade gate. Shape A (26.1–26.4) active; **Shape B (26.5) disabled 2026-07-05** — widened the `~VM_PROT_WRITE` COW strip (vm_map.c:6202) instead of the RWX gate (vm_map.c:5997), breaking COW and crashing the debugger (SPTM `VIOLATION_ILLEGAL_MAP`). Retired on 26.5+: SPTM code-mod (debugger + Substrate tweaks) uses write-then-flip via `vm_protect(VM_PROT_COPY)` → `XNU_USER_DEBUG`, so no RWX patch is needed. **SHAPE C ADDED (2026-09-22, cloudOS 26.4 `c0ecdb4b…`, jb):** the patch logged `[-] vm_map_protect write-downgrade gate not found` on this base, which `make test_fw_patches` is built to fail on. Two independent causes, both confirmed by disassembling the 26.4 research kernelcache. **(1) The gate is compiled differently.** Where 26.1/26.3 emit a flag-setting `bics` plus a separate `tbnz wFlags,#22,skip`, 26.4 folds the two conditions into a conditional compare and leaves one branch: `and wFlags,wFlags,#0x400000` / `mov wMask,#6` / `bic wMask,wMask,wProt` / `cmp wMask,#0` / `ccmp wFlags,#0,#0,eq` / `b.ne skip`, with `and wProt,wProt,#0xfffffffb` (clear `VM_PROT_EXECUTE`, keep R|W) inside the guarded block. Same mask `#6`, same entry bit 22, same downgrade — rewriting that single `b.ne` to an unconditional `b` bypasses both conditions at once, exactly as Shape A's rewrite does (there the `tbnz` becomes dead). Observed at VA `0xFFFFFE0008DCAEA0` → `0xFFFFFE0008DCAED0` (file `0x1DC6EA0`). **(2) The search window stopped short.** `findFuncEnd` ends at the next `pacibsp`; on 26.4 the block holding the `"vm_map_protect("` panic string ends at its own prologue `0x6B8` bytes *before* the gate, so the window derived from the string anchor never reached it. **Reveal procedure for Shape C:** the signature is its own anchor rather than a byte window — across the whole `com.apple.kernel __TEXT_EXEC` (8.4 MB) even the bare `mov wMask,#6 ; bic wMask,wMask,wProt` prefix occurs **exactly once**, and the matcher additionally requires the bit-22 mask before it and the execute-clearing `and` inside the guarded block, then demands a unique hit across all code ranges. Widening by an offset was rejected as an offset-shaped anchor. **Backward compatibility:** Shape A is untouched and still tried first, so 26.1/26.3 take precisely the path they always took and Shape C is unreachable there. **VALIDATED on-device (2026-09-23, `17,3_26.4_23E246` + cloudOS 26.4 `23E5207q`, JB, `vm create` host-mount deploy):** the deployed `kernelcache.research.vphone600` carries the rewritten gate — `0xFFFFFE0008DCAEA0` disassembles as unconditional `b #0xfffffe0008dcaed0` with `and w8,w8,#0x400000 / mov w9,#6 / bic w9,w9,w20 / cmp w9,#0 / ccmp w8,#0,#0,eq` intact above it — and the VM boots clean: zero `panic(` / `stackshot` markers across the whole boot log, SpringBoard up, Safari and Sileo both running, so the JB userland and TweakLoader come up with the patch live. The gate is the same one on a 26.4 base whichever userland rides on top, since `fw_patch_jb` patches the cloudOS kernelcache, not the iOS one. Matching was separately checked on `17,3_27.0_24A435` + the same base. **Still not exercised:** a debugger attach or a tweak RWX write specifically — that is the failure mode Shape B produced (broken COW, SPTM `VIOLATION_ILLEGAL_MAP`), and a clean boot with Sileo running is good evidence but not that test. Note the source also disagreed with itself about the covered range — headers said "Shape A (26.1 / 26.3)", line 69 said "26.1-26.4"; on 26.4 the answer is neither, it is Shape C. **PREFILTERED (2026-09-28, no change to the gate or the patch):** because the Shape C scan is deliberately unscoped it walks all 8.4 MB of kernel text, and it was decoding five instructions at every one of the ~2.1M offsets only to reject almost all of them on the first one. Sampling a Release `fw patch` (8623 samples, `sample`) put 93% of the whole run in `scanRange` → `ARM64Disassembler.disassemble`, and 72% of that inside `cs_disasm` — not in the decoder but in Capstone's *printer*: `printInst` / `printAliasInstr` / `matchAliasPatterns`, `vsnprintf` / `SStream_concat`, and `map_set_alias_id` → `name2id`'s `strcmp` chain. `AArch64_LLVM_getInstruction`, the actual decode, was 6%. A rejection-only raw-word gate now runs first (`ARM64Inst.isMOVZW` + `movImm16 == 6`, or `isORRImmW` + `rn == 31`), so Capstone is only asked about offsets that could open with `mov wMask,#6`. **Nothing is decided by the prefilter** — survivors take exactly the decode and the checks they always did, and every positive determination is still Capstone's. Both encodings of `mov wD,#6` are accepted although only MOVZ can reach the existing `mnemonic == "mov"` check (the MOV-bitmask alias applies only when the immediate is *not* MOVZ-encodable, so `orr w9,wzr,#6` = `0x321F07E9` prints as `orr`), which keeps the gate independent of that aliasing rule; `ARM64InstTests` pins both words and the printer's answer for each. The same treatment was applied to the one other full-text scan, `patchThreadSetStateEntitlementFlag` (`isBorBL`, extended-only). Measured on `17,3_26.4` + cloudOS 26.4, Release: the patch step 28.81 s → 1.28 s, whole `fw patch` 48.98 s → 21.68 s standard and ~61 s → ~28 s extended, instructions retired 1.006e12 → 5.38e11. **Verified byte-identical:** all four bases (26.1 / 26.4 / 26.6.2 / 27.0) × both presets, HEAD vs HEAD+prefilter, every file in each restore tree hashed — 12/12 identical (196/186/186/185 files), same 172 standard / 183 extended patch counts, same `0x1DC6EA0` rewrite, no undeclared-patch warnings. |    Y/N     |
 | JB-25c| B     | `patchVmMapDeleteImmutableCode`       | `_vm_map_delete` permanent-entry immutable-code exception (vm_map.c:8855)                            | **Frida Stalker repeated-`VM_PROT_COPY` fix (opt-in `--frida`).** Stalker's write-then-flip leaves a CSM-associated permanent entry at current `RW` / max `RWX`; XNU's "debugger may undo executable mappings" exception tests `entry->protection & VM_PROT_EXECUTE` (current, bit 9), which is clear, so the entry stays permanent and the next fixed overwrite returns `KERN_PROTECTION_FAILURE`. Retarget the execute test to the packed `max_protection` bit (bit 9 → bit 13; `protection:3`@7..9, `max_protection:4`@11..14 in the `[entry,#0x38]` flags word). Semantic matcher: packed-flags load + `vme_permanent` (bit 19) + the inlined `developer_mode_state()` byte-bit-0 read + the current-X test bound to the immutable-code cluster (Shape A: shares the remove-flags fallback target; Shape B: branches to the permanent-continuation target). The remove-flags bit is matched structurally (a test of a non-entry register), not by source constant (VM_MAP_REMOVE_* bit numbers drift across XNU versions). The later CSM current-X `#9` test in the same window is deliberately excluded (different branch target). Exactly two gates or fail closed; branch bytes from the Keystone-backed `ARM64Encoder.encodeTestBitBranch`, Capstone round-trip verified (sense/bit/target). Verified on the `c0ecdb4b` 26.4 kernel: two records at file-off `0x1DBE14C` (`tbz w8,#9→#0xd`) and `0x1DBE828` (`tbnz w8,#9→#0xd`). | `--frida` |
 | JB-26 | B     | `patch_iomfb_swapend_variable_size`   | IOMFB userclient method-5 (SwapEnd) `__DATA_CONST` dispatch entry (`checkStructureInputSize`)        | **iOS-27 VZ-view fix, kernel half — paired with DSC force-kern (DSC-patch item 11).** The 26.4 userclient's method-5 dispatch entry hard-checks `checkStructureInputSize == 0x588`; forced-kern iOS 27 sends its native `0x6e0`. Rewrite the size field to `kIOUCVariableStructureSize (0xFFFFFFFF)` so `IOUserClient::externalMethod` accepts 27's struct and reaches the handler. Anchor (structural): the sole `__DATA_CONST` entry `{ptr(ptrauth, top-byte≥0x80), scalarIn=0, structIn=0x588, scalarOut=0, structOut=0}` (verified unique; decompressed file-off 0x9c7228). No-op-in-effect for version-matched 26.x (sends 0x588). Re-enabled 2026-07-15 (was disabled when 27 present-path was still unknown). |     Y      |
 | JB-27 | B     | `patch_iomfb_swapend_handler_size`    | method-5 handler internal size gate (`cmp w2,#0x588 ; b.ne <err>`)                                   | Companion to JB-26: beyond the dispatch-table check the handler re-checks the struct size (`cmp w2,#0x588 ; b.ne <kIOReturnBadArgument>`; verified unique at decompressed file-off 0x16ae22c; success path forwards the raw struct ptr to a `vtable+0x590` paravirt swap method). Retarget the `cmp` immediate to `0x6e0` so forced-kern iOS 27's native SwapEnd reaches real swap processing (27's IOMFBSwapRec prefix matches 26.x → handler reads valid fields). Semantic anchor (`cmp w2,#imm` word + following `b.ne` decode). Enabled together with JB-26 + DSC force-kern for iOS 27. |     Y      |
@@ -1422,3 +1542,9 @@ coordinate through `CLLocationManager` for authorized clients. The location
 state is an atomically replaced JSON file, and removal restores the native
 path. Maps showed the Tokyo and Apple Park coordinates in the running 26.4 VM;
 the automatic SystemHook injection path was verified after relaunching Maps.
+
+**Removed (2026-09-28).** The hook worked around a symptom of the former EXP
+patches (issue #438), which `standard` now leaves off; see the note at the top.
+SystemHook no longer loads `libvlocation.dylib`, the bundle no longer ships it,
+and vphoned's `location.*` methods call IcliKit directly again. A guest that
+already has `/usr/lib/libvlocation.dylib` keeps the file, but nothing loads it.

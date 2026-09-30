@@ -26,6 +26,7 @@ class VPhoneVirtualMachineAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_: Notification) {
         NSApp.setActivationPolicy(command.noGraphics ? .prohibited : .regular)
+        VPhoneDockName.set(VPhoneDockName.name(forConfig: command.config))
 
         signal(SIGINT, SIG_IGN)
         let src = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
@@ -109,6 +110,7 @@ class VPhoneVirtualMachineAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        let screenRecorder = VPhoneScreenRecorder()
         if !command.noGraphics {
             let keySender = VPhoneVirtualMachineKeySender(vm: vm, control: control)
             let wc = VPhoneVirtualMachineWindowController()
@@ -119,7 +121,7 @@ class VPhoneVirtualMachineAppDelegate: NSObject, NSApplicationDelegate {
                 screenScale: options.screenScale,
                 keySender: keySender,
                 control: control,
-                ecid: vm.ecidHex,
+                name: VPhoneDockName.name(forConfig: options.configURL),
                 sceneIdentifier: options.configURL
                     .deletingLastPathComponent()
                     .standardizedFileURL
@@ -186,22 +188,8 @@ class VPhoneVirtualMachineAppDelegate: NSObject, NSApplicationDelegate {
                 }
                 mc.updateCameraConnectionState(connected: camServer.isConnected)
             }
-            let recorder = VPhoneScreenRecorder()
-            mc.screenRecorder = recorder
+            mc.screenRecorder = screenRecorder
             menuController = mc
-
-            let socketPath = options.configURL
-                .deletingLastPathComponent()
-                .appendingPathComponent("vphone.sock").path
-            let server = VPhoneHostAutomationServer(socketPath: socketPath)
-            server.start(
-                captureView: wc.captureView!,
-                screenRecorder: recorder,
-                control: control,
-                screenWidth: options.screenWidth,
-                screenHeight: options.screenHeight,
-            )
-            hostAutomationServer = server
 
             // Wire location toggle through onConnect/onDisconnect
             control.onConnect = { [weak self, weak mc, weak provider = locationProvider] caps in
@@ -262,6 +250,20 @@ class VPhoneVirtualMachineAppDelegate: NSObject, NSApplicationDelegate {
                 provider?.stopForwarding()
             }
         }
+
+        // Headless launches serve the socket too, over guest-side input and screenshots.
+        let socketPath = options.configURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("vphone.sock").path
+        let server = VPhoneHostAutomationServer(socketPath: socketPath)
+        server.start(
+            captureView: windowController?.captureView,
+            screenRecorder: screenRecorder,
+            control: control,
+            screenWidth: options.screenWidth,
+            screenHeight: options.screenHeight,
+        )
+        hostAutomationServer = server
     }
 
     @MainActor

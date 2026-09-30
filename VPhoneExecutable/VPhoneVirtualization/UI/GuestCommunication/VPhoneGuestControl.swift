@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import Virtualization
+import VPhoneCoreKit
 
 /// The VM UI's direct HTTP client over VSOCK. It does not open a host TCP
 /// listener; only --api-listen creates one through VPhoneAPIProxy.
@@ -46,6 +47,55 @@ final class VPhoneGuestControl {
     @ObservationIgnored var guestBinaryURL: URL?
     @ObservationIgnored var onConnect: (([String]) -> Void)?
     @ObservationIgnored var onDisconnect: (() -> Void)?
+
+    /// The guest interface orientation: the one the window last read, or the
+    /// one a menu rotation is turning to. Nil until one is known, and again
+    /// after a disconnect.
+    var interfaceOrientation: VPhoneDisplayOrientation? {
+        didSet {
+            guard interfaceOrientation != oldValue else { return }
+            for observer in orientationObservers {
+                observer(interfaceOrientation)
+            }
+        }
+    }
+
+    /// True while a menu rotation waits for the guest, so the poll does not
+    /// turn the window back to an orientation read before the guest turned.
+    var isChangingOrientation: Bool {
+        pendingRotations > 0
+    }
+
+    @ObservationIgnored private var pendingRotations = 0
+    @ObservationIgnored private var orientationObservers: [(VPhoneDisplayOrientation?) -> Void] = []
+
+    func observeInterfaceOrientation(_ observer: @escaping (VPhoneDisplayOrientation?) -> Void) {
+        orientationObservers.append(observer)
+    }
+
+    /// Turns the guest to the first of `candidates` it accepts. Each is set
+    /// before the guest is asked, so the window turns with the guest instead
+    /// of after it, and a refused one moves straight on to the next. When
+    /// every one is refused, the orientation from before is restored and the
+    /// last refusal is thrown.
+    func rotate(toFirstOf candidates: [VPhoneDisplayOrientation]) async throws {
+        let previous = interfaceOrientation
+        pendingRotations += 1
+        defer { pendingRotations -= 1 }
+        var refusal: Error = ControlError.protocolError("no orientation to rotate to")
+        for orientation in candidates {
+            interfaceOrientation = orientation
+            do {
+                _ = try await call("display.rotation", params: ["orientation": String(orientation.rawValue)])
+                return
+            } catch {
+                print("[rotate] \(orientation) refused: \(error)")
+                refusal = error
+            }
+        }
+        interfaceOrientation = previous
+        throw refusal
+    }
 
     var useGuestTouchInjection: Bool {
         guard isConnected, guestCapabilities.contains("touch"),
@@ -136,6 +186,7 @@ final class VPhoneGuestControl {
         guestCapabilities = []
         guestIPAddress = nil
         guestIOSVersion = nil
+        interfaceOrientation = nil
         if wasConnected {
             onDisconnect?()
         }
@@ -201,6 +252,13 @@ final class VPhoneGuestControl {
         }
     }
 
+    /// Calls one vphoned operation after the input events already queued, so a
+    /// key or text request cannot overtake a tap sent before it.
+    func callAfterQueuedInput(_ method: String, params: [String: Any] = [:]) async throws -> [String: Any] {
+        await orderedInput?.value
+        return try await call(method, params: params)
+    }
+
     func isDeveloperModeEnabled() async throws -> Bool {
         try await call("developer_mode.status")["enabled"] as? Bool ?? false
     }
@@ -264,7 +322,6 @@ final class VPhoneGuestControl {
         case "settings_get": method = "settings.get"
         case "settings_set": method = "settings.set"
         case "low_power_mode": method = "power.low_power_mode"
-        case "accessibility_tree": method = "accessibility.tree"
         default: throw ControlError.protocolError("unknown operation \(type)")
         }
         var params = request
@@ -338,6 +395,32 @@ final class VPhoneGuestControl {
         return result["msg"] as? String ?? "Installed \(localURL.lastPathComponent)."
     }
 
+    /// Where the Files app shows a dropped file: On My iPhone › vphone-drop.
+    static let dropFolder = "vphone-drop"
+
+    /// Uploads a file dropped on the window, then has vphoned move it into
+    /// the Files app's On My iPhone › vphone-drop. vphoned finds that storage,
+    /// keeps a name already taken by numbering the new one, and gives the
+    /// file the owner and mode the Files app uses. Returns the name used.
+    func saveDroppedFile(localURL: URL) async throws -> String {
+        guard guestCapabilities.contains("files_app_drop") else {
+            throw ControlError.unsupportedCapability("files_app_drop")
+        }
+        let data = try Data(contentsOf: localURL, options: .mappedIfSafe)
+        let path = "/var/root/Library/Caches/vphoned-drop-\(UUID().uuidString)"
+        try await createDirectory(path: "/var/root/Library/Caches")
+        try await uploadFile(path: path, data: data)
+        do {
+            let result = try await call(
+                "files.save_to_files_app", params: ["path": path, "name": localURL.lastPathComponent],
+            )
+            return result["name"] as? String ?? localURL.lastPathComponent
+        } catch {
+            try? await deleteFile(path: path)
+            throw error
+        }
+    }
+
     func installBootstrap(layout: String, localURL: URL? = nil) async throws -> [String: Any] {
         guard guestCapabilities.contains("bootstrap_install") else {
             throw ControlError.unsupportedCapability("bootstrap_install")
@@ -393,6 +476,26 @@ final class VPhoneGuestControl {
             changeCount: info["change_count"] as? Int ?? 0,
             imageData: image,
         )
+    }
+
+    /// The guest clipboard without its image, read after the input already
+    /// queued so it sees the effect of a key sent before it.
+    func clipboardInfoAfterQueuedInput() async throws -> ClipboardContent {
+        let info = try await callAfterQueuedInput("clipboard.get")
+        return ClipboardContent(
+            text: info["text"] as? String,
+            types: info["types"] as? [String] ?? [],
+            hasImage: info["has_image"] as? Bool ?? false,
+            changeCount: info["change_count"] as? Int ?? 0,
+            imageData: nil,
+        )
+    }
+
+    /// The guest clipboard image as PNG.
+    func clipboardImagePNG() async throws -> Data {
+        let response = try await http(method: "GET", path: "/v1/clipboard/image")
+        guard response.status == 200 else { throw try httpError(response) }
+        return response.body
     }
 
     func clipboardSet(text: String) async throws {
@@ -561,6 +664,9 @@ private final class VPhoneHTTPTransaction: @unchecked Sendable {
     }
 
     func run() throws -> VPhoneHTTPResponse {
+        // vphoned waits for this side to close before it releases the
+        // connection, because its own close would reset unsent reply bytes.
+        defer { connection.close() }
         let fd = connection.fileDescriptor
         guard fcntl(fd, F_SETNOSIGPIPE, 1) != -1 else {
             throw VPhoneGuestControl.ControlError.notConnected

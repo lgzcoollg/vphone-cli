@@ -19,6 +19,15 @@ nonisolated struct VPhoneLaunchpadError: LocalizedError {
     var failureReason: String? {
         detail
     }
+
+    /// Any error as one string: the message, and under it the output that says
+    /// why. For a view that shows a single line of text rather than an alert
+    /// with its own detail area.
+    static func message(for error: any Error) -> String {
+        [error.localizedDescription, (error as? VPhoneLaunchpadError)?.detail]
+            .compactMap(\.self)
+            .joined(separator: "\n")
+    }
 }
 
 // MARK: - Result
@@ -36,10 +45,17 @@ nonisolated struct VPhoneLaunchpadCommandResult: Sendable {
         lines.suffix(12).joined(separator: "\n")
     }
 
-    /// The last line that looks like a JSON document. stderr is merged into
-    /// the same stream, so warnings can precede it.
+    /// The JSON document in the output.
+    ///
+    /// stderr is merged into the same stream, so warnings can precede it, and a
+    /// pretty-printed document spans many lines — `fw patches --json` prints
+    /// one. Only its opening brace sits at column zero, so the last line that
+    /// opens a document starts it, and it runs to the end of the output.
     var jsonData: Data? {
-        lines.last { $0.hasPrefix("[") || $0.hasPrefix("{") }.map { Data($0.utf8) }
+        guard let start = lines.lastIndex(where: { $0.hasPrefix("[") || $0.hasPrefix("{") }) else {
+            return nil
+        }
+        return Data(lines[start...].joined(separator: "\n").utf8)
     }
 }
 
@@ -92,16 +108,32 @@ struct VPhoneLaunchpadCommandLine {
         return plain && !argument.isEmpty ? argument : "'\(argument.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
+    /// The fraction a `progress <done> <total>` line reports, or nil for any
+    /// other line.
+    nonisolated static func progress(in line: String) -> Double? {
+        let fields = line.split(separator: " ")
+        guard fields.count == 3, fields[0] == "progress",
+              let done = Double(fields[1]), let total = Double(fields[2]), total > 0
+        else { return nil }
+        return min(1, done / total)
+    }
+
     /// Runs to completion. Cancelling the calling task sends SIGINT.
-    /// `onLine` runs on the reader thread, never on the main actor.
+    /// `onLine` and `onProgress` run on the reader thread, never on the main
+    /// actor. Progress lines go only to `onProgress`, never to the output.
     func run(
         _ arguments: [String],
         recordInHistory: Bool = true,
         onLine: (@Sendable (String) -> Void)? = nil,
+        onProgress: (@Sendable (Double) -> Void)? = nil,
     ) async throws -> VPhoneLaunchpadCommandResult {
         let entry = recordInHistory ? history.record(Self.display(arguments)) : nil
         let collector = VPhoneLaunchpadLineCollector()
         let child = try VPhoneLaunchpadChildProcess(executable: executable, arguments: arguments) { line in
+            if let fraction = Self.progress(in: line) {
+                onProgress?(fraction)
+                return
+            }
             collector.append(line)
             onLine?(line)
         }
@@ -121,8 +153,9 @@ struct VPhoneLaunchpadCommandLine {
     func runChecked(
         _ arguments: [String],
         onLine: (@Sendable (String) -> Void)? = nil,
+        onProgress: (@Sendable (Double) -> Void)? = nil,
     ) async throws -> VPhoneLaunchpadCommandResult {
-        let result = try await run(arguments, onLine: onLine)
+        let result = try await run(arguments, onLine: onLine, onProgress: onProgress)
         try Task.checkCancellation()
         guard result.succeeded else {
             throw VPhoneLaunchpadError(

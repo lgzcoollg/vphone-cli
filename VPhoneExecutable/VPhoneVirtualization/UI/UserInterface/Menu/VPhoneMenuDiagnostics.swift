@@ -17,8 +17,6 @@ extension VPhoneMenuController {
         menu.addItem(makePanelItem(.console, "Console", keyEquivalent: "l", symbol: "terminal"))
         menu.addItem(makePanelItem(.crashLogs, "Crash Logs", keyEquivalent: "c", symbol: "exclamationmark.triangle"))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(makePanelItem(.uiInspector, "UI Inspector", keyEquivalent: "u", symbol: "rectangle.dashed"))
-        menu.addItem(NSMenuItem.separator())
 
         let devModeStatus = makeItem(
             "Developer Mode Status",
@@ -29,15 +27,23 @@ extension VPhoneMenuController {
         connectDevModeStatusItem = devModeStatus
         menu.addItem(devModeStatus)
 
+        let agentItem = NSMenuItem(title: "Guest Agent", action: nil, keyEquivalent: "")
+        agentItem.image = menuSymbol("antenna.radiowaves.left.and.right")
+        let agentMenu = NSMenu(title: "Guest Agent")
+        agentMenu.autoenablesItems = false
+
         let ping = makeItem("Ping", action: #selector(sendPing), symbol: "dot.radiowaves.left.and.right")
         ping.isEnabled = false
         connectPingItem = ping
-        menu.addItem(ping)
+        agentMenu.addItem(ping)
 
         let guestHash = makeItem("Guest Agent Hash", action: #selector(queryGuestHash), symbol: "number")
         guestHash.isEnabled = false
         connectGuestHashItem = guestHash
-        menu.addItem(guestHash)
+        agentMenu.addItem(guestHash)
+
+        agentItem.submenu = agentMenu
+        menu.addItem(agentItem)
 
         item.submenu = menu
         return item
@@ -68,6 +74,9 @@ extension VPhoneMenuController {
     func updatePanelAvailability(capabilities: [String]) {
         for (panel, item) in panelMenuItems {
             item.isEnabled = capabilities.contains(panel.capability)
+        }
+        for item in rotateMenuItems {
+            item.isEnabled = capabilities.contains("display")
         }
     }
 

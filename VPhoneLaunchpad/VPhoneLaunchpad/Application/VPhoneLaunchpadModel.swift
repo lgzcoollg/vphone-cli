@@ -1,19 +1,16 @@
 import Foundation
 import Observation
 
-/// Owns the three stages and decides which of them the segmented control
-/// shows. Host Setup is always there; Core Bundle appears once the required
-/// host checks pass; Machines appears once the active bundle passes host
-/// preflight. After setup has completed once, all three stay visible and a
-/// regression only marks Host Setup, so machines are never hidden by, say,
-/// a helper that needs updating.
+/// Owns the host checks, the installed bundles and the machine library. The
+/// window always shows the machines; Host Setup and Core Bundle are sheets
+/// over it. On launch the first stage that is not ready opens by itself, and
+/// a toolbar button marks a stage that regresses later.
 @MainActor
 @Observable
 final class VPhoneLaunchpadModel {
-    enum Section: String, CaseIterable, Identifiable {
+    enum Panel: String, Identifiable {
         case hostSetup
         case coreBundle
-        case machines
 
         var id: Self {
             self
@@ -23,7 +20,6 @@ final class VPhoneLaunchpadModel {
             switch self {
             case .hostSetup: String(localized: "Host Setup")
             case .coreBundle: String(localized: "Core Bundle")
-            case .machines: String(localized: "Machines")
             }
         }
     }
@@ -35,74 +31,48 @@ final class VPhoneLaunchpadModel {
     let bundles: VPhoneLaunchpadCoreBundle
     let machines: VPhoneLaunchpadMachineLibrary
 
-    var selection: Section = .hostSetup
+    var panel: Panel?
+    /// The panel to open once the sheet on screen has closed.
+    private var queuedPanel: Panel?
     private(set) var isStarted = false
 
-    private static let setupCompletedKey = "VPhoneLaunchpadSetupCompleted"
-    private static let showAllSectionsKey = "VPhoneLaunchpadShowAllSections"
-
     init() {
-        let environment = ProcessInfo.processInfo.environment["VPHONE_LIBRARY_ROOT"]
-        libraryRoot = environment.map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".vphone/machines", isDirectory: true)
+        libraryRoot = URL(fileURLWithPath: VPhoneLaunchpadMachineLocations.defaultRoot, isDirectory: true)
         host = VPhoneLaunchpadHostSetup(helper: helper, libraryRoot: libraryRoot)
         bundles = VPhoneLaunchpadCoreBundle(helper: helper, history: history)
-        machines = VPhoneLaunchpadMachineLibrary(libraryRoot: libraryRoot, bundles: bundles, helper: helper)
+        machines = VPhoneLaunchpadMachineLibrary(bundles: bundles, helper: helper)
     }
 
-    // MARK: - Sections
+    // MARK: - Panels
 
-    #if DEBUG
-        /// Snapshot mode keeps setup state in memory, off the real defaults.
-        var previewSetupCompleted: Bool?
-    #endif
-
-    private var setupCompleted: Bool {
-        get {
-            access(keyPath: \.setupCompleted)
-            #if DEBUG
-                if let previewSetupCompleted {
-                    return previewSetupCompleted
-                }
-            #endif
-            return UserDefaults.standard.bool(forKey: Self.setupCompletedKey)
+    /// Opens `next`. Another panel on screen closes first, so `next` arrives
+    /// as a sheet of its own instead of replacing that sheet's content.
+    func present(_ next: Panel) {
+        guard let current = panel, current != next else {
+            panel = next
+            return
         }
-        set {
-            withMutation(keyPath: \.setupCompleted) {
-                UserDefaults.standard.set(newValue, forKey: Self.setupCompletedKey)
-            }
-        }
+        queuedPanel = next
+        panel = nil
     }
 
-    var sections: [Section] {
-        #if DEBUG
-            if UserDefaults.standard.bool(forKey: Self.showAllSectionsKey) {
-                return Section.allCases
-            }
-        #endif
-        if setupCompleted {
-            return Section.allCases
+    /// Called when a panel's sheet has closed.
+    func panelDidDismiss() {
+        guard let next = queuedPanel else {
+            return
         }
-        var sections: [Section] = [.hostSetup]
-        if host.requiredPassed {
-            sections.append(.coreBundle)
-            if bundles.isReady {
-                sections.append(.machines)
-            }
-        }
-        return sections
+        queuedPanel = nil
+        panel = next
     }
 
-    func title(for section: Section) -> String {
-        switch section {
-        case .hostSetup where setupCompleted && !host.isChecking && !host.requiredPassed:
-            "\(section.title) ▲"
-        case .coreBundle where setupCompleted && !bundles.isReady && !bundles.installed.isEmpty:
-            "\(section.title) ▲"
-        default:
-            section.title
-        }
+    // MARK: - Attention
+
+    var hostNeedsAttention: Bool {
+        !host.isChecking && !host.requiredPassed
+    }
+
+    var bundleNeedsAttention: Bool {
+        host.requiredPassed && !bundles.isReady && !bundles.isInstalling && bundles.progress?.canSkip != true
     }
 
     /// Installing a bundle needs the helper (root-owned store) and Developer
@@ -127,54 +97,94 @@ final class VPhoneLaunchpadModel {
                 return
             }
         #endif
-        await host.refresh()
+        startControl()
+        // Host checks, installed bundles and the helper state were read at
+        // init. These confirm them without holding up the machine list; the
+        // network probe and the GitHub lists come last.
+        machines.startMonitoring()
+        async let listed: Void = machines.refresh()
+        async let hostChecked: Void = host.refresh()
+        await bundles.checkActive()
+        await hostChecked
         if case .outdated = helper.state {
             await host.installHelper()
             await host.refresh()
+            await bundles.checkActive()
         }
-        await bundles.refresh()
-        await machines.refresh()
-        machines.startMonitoring()
-        advance(selectNewest: true)
+        await listed
+        // An unfinished install is picked up in the inspector instead.
+        if panel == nil, bundles.progress == nil || bundles.progress?.isFinished == true {
+            panel = !host.requiredPassed ? .hostSetup : !bundles.isReady ? .coreBundle : nil
+        }
+        await bundles.fetchReleases()
+        await bundles.fetchArtifacts()
+    }
+
+    // MARK: - Command line
+
+    /// Serves `vphone-launchpad-cli` for as long as the app runs. Without the
+    /// socket the window works as before; the CLI then says it cannot connect.
+    private var control: VPhoneLaunchpadControlServer?
+
+    private func startControl() {
+        let commands = VPhoneLaunchpadControlCommands(model: self)
+        let server = VPhoneLaunchpadControlServer { request, emit in
+            await commands.handle(request, emit: emit)
+        }
+        do {
+            try server.start()
+            control = server
+        } catch {
+            print("[control] \(VPhoneLaunchpadError.message(for: error))")
+        }
     }
 
     func refreshHost() async {
         await host.refresh()
-        advance(selectNewest: true)
     }
 
+    // MARK: - Bundle install
+
+    /// An install runs in the inspector, not in the sheet it started from,
+    /// so the sheet closes and the inspector opens on its progress.
     func installBundle(_ release: VPhoneLaunchpadRelease) async {
+        revealInstall()
         await bundles.install(release)
         await machines.refresh()
-        advance(selectNewest: false)
+    }
+
+    func installArtifact(_ artifact: VPhoneLaunchpadArtifact) async {
+        revealInstall()
+        await bundles.installArtifact(artifact)
+        await machines.refresh()
     }
 
     func installLocalBundle(_ source: URL) async {
+        revealInstall()
         await bundles.installLocal(source)
         await machines.refresh()
-        advance(selectNewest: false)
     }
+
+    func retryInstall() async {
+        await bundles.retry()
+        await machines.refresh()
+    }
+
+    private func revealInstall() {
+        panel = nil
+        showsInspector = true
+        isInstallExpanded = true
+    }
+
+    // MARK: - Inspector
+
+    var showsInspector = true
+    var isInstallExpanded = true
 
     func removeBundle(_ version: String) async {
         await bundles.remove(version)
         if let active = bundles.activeVersion, bundles.active?.preflight == .pending {
             await bundles.verify(active)
-        }
-        advance(selectNewest: false)
-    }
-
-    /// Records completed setup and moves the selection to a newly revealed
-    /// section, or back to one that still exists.
-    private func advance(selectNewest: Bool) {
-        let before = sections
-        if host.requiredPassed, bundles.isReady {
-            setupCompleted = true
-        }
-        let after = sections
-        if selectNewest {
-            selection = !host.requiredPassed ? .hostSetup : bundles.isReady ? .machines : .coreBundle
-        } else if after.count > before.count || !after.contains(selection) {
-            selection = after.last ?? .hostSetup
         }
     }
 }

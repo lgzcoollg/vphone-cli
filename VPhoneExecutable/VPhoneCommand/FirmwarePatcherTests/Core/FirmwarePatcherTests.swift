@@ -3,6 +3,7 @@
 @testable import FirmwarePatcher
 import Foundation
 import Testing
+import VPhonePatchKit
 
 struct ARM64ConstantTests {
     let disasm = ARM64Disassembler()
@@ -271,6 +272,41 @@ struct ARM64InstTests {
         #expect(!ARM64Inst.isMOVZW(0xF941_F001))
     }
 
+    /// The prefilter in front of the vm_map_protect Shape C scan accepts both ways
+    /// an assembler can spell `mov wD, #imm`, so it cannot narrow what Capstone is
+    /// then asked to confirm. This pins both encodings and records which mnemonic
+    /// the printer gives each: for a MOVZ-encodable value like #6 the ORR form
+    /// prints as `orr`, because the MOV-bitmask alias applies only when MOVZ cannot
+    /// hold the immediate. The scan does not rely on that — it lets the ORR form
+    /// through either way — but if the printer ever changed its mind, this is where
+    /// it shows up.
+    @Test func `orr immediate W is the other mov immediate encoding`() {
+        // `mov w9, #6` and `movz w9, #6` both assemble to this (clang, arm64).
+        let movz: UInt32 = 0x5280_00C9
+        #expect(mnemonic(of: movz) == "mov" || mnemonic(of: movz) == "movz")
+        #expect(ARM64Inst.isMOVZW(movz))
+        #expect(ARM64Inst.movImm16(movz) == 6)
+        #expect(ARM64Inst.rd(movz) == 9)
+        #expect(!ARM64Inst.isORRImmW(movz))
+
+        // `orr w9, wzr, #6` — same value, logical-immediate encoding.
+        let orr6: UInt32 = 0x321F_07E9
+        #expect(ARM64Inst.isORRImmW(orr6))
+        #expect(ARM64Inst.rn(orr6) == 31) // wzr
+        #expect(ARM64Inst.rd(orr6) == 9)
+        #expect(!ARM64Inst.isMOVZW(orr6))
+        #expect(mnemonic(of: orr6) == "orr")
+
+        // `orr w9, wzr, #7` — a different element size behind the same mask.
+        let orr7: UInt32 = 0x3200_0BE9
+        #expect(ARM64Inst.isORRImmW(orr7))
+        #expect(ARM64Inst.rn(orr7) == 31)
+
+        // Neither a register-form AND nor a branch is an ORR-immediate.
+        #expect(!ARM64Inst.isORRImmW(0x0A05_0083))
+        #expect(!ARM64Inst.isORRImmW(0x1400_0000))
+    }
+
     @Test func `and reg W`() {
         let w: UInt32 = 0x0A05_0083 // and w3, w4, w5
         #expect(mnemonic(of: w) == "and")
@@ -293,6 +329,28 @@ struct ARM64InstTests {
         // b.eq vs b.ne (cond field)
         #expect(ARM64Inst.isBEQ(0x5400_0020)) // b.eq #4
         #expect(!ARM64Inst.isBEQ(0x5400_0021)) // b.ne #4
+    }
+
+    /// `isBorBL` gates the thread_set_state scan, which then checks the decoded
+    /// mnemonic for exactly `b` or `bl`. It has to accept both and nothing else, or
+    /// the scan quietly loses sites.
+    @Test func `b or bl`() throws {
+        let b = try #require(ARM64Encoder.encodeB(from: 0x1000, to: 0x2000)?
+            .withUnsafeBytes { $0.load(as: UInt32.self) })
+        let bl = try #require(ARM64Encoder.encodeBL(from: 0x1000, to: 0x2000)?
+            .withUnsafeBytes { $0.load(as: UInt32.self) })
+        #expect(mnemonic(of: b) == "b")
+        #expect(mnemonic(of: bl) == "bl")
+        #expect(ARM64Inst.isBorBL(b))
+        #expect(ARM64Inst.isBorBL(bl))
+        // Backward branches set the sign bits of imm26; the mask must ignore them.
+        let back = try #require(ARM64Encoder.encodeB(from: 0x2000, to: 0x1000)?
+            .withUnsafeBytes { $0.load(as: UInt32.self) })
+        #expect(ARM64Inst.isBorBL(back))
+        // A conditional branch, a cbz and a movz are not unconditional branches.
+        #expect(!ARM64Inst.isBorBL(0x5400_0020)) // b.eq #4
+        #expect(!ARM64Inst.isBorBL(0x3400_0020)) // cbz w0, #4
+        #expect(!ARM64Inst.isBorBL(0x5280_02C0)) // movz w0, #0x16
     }
 
     @Test func `compare and branch`() {
@@ -522,18 +580,22 @@ struct IM4PPayloadParityTests {
 }
 
 struct FirmwarePipelineTests {
-    @Test func `public JB includes former EXP kernel and device tree patchers`() throws {
+    @Test func `public JB includes the former EXP device tree patchers, not the hv_vmm rename`() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
         let pipeline = FirmwarePipeline(vmDirectory: root, variant: .jb, verbose: false)
         let components = pipeline.buildComponentList(
             restoreDir: root,
-            iosBaseIs18: false,
-            iosBaseIs27: true,
-            cloudOSIsFridaCapable: true,
+            iOSBase: VPhoneVersion("27.0"),
         )
+        // Base and jailbreak, and no KernelExperimentalPatcher: the hv_vmm_present
+        // concealment is off unless a preset or a checkmark asks for it, and a
+        // patcher that would write nothing is not built. See
+        // FirmwareKernelHypervisorPatchSet for what it does to a 26.4 guest.
         let kernel = try #require(components.first { $0.name == "kernelcache" })
-        #expect(kernel.patcherFactories.count == 3)
-        #expect(kernel.patcherFactories[2](Data(), false) is KernelExperimentalPatcher)
+        #expect(kernel.patcherFactories.count == 2)
+        for factory in kernel.patcherFactories {
+            #expect(try !(factory(Data(), false) is KernelExperimentalPatcher))
+        }
 
         let deviceTree = try #require(components.first { $0.name == "DeviceTree" })
         let patcher = try #require(deviceTree.patcherFactories.first?(Data(), false) as? DeviceTreePatcher)

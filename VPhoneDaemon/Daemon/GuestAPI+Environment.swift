@@ -14,7 +14,6 @@ extension GuestAPI {
         "SystemHook-vphone.dylib",
         "libvcamcaptured.dylib",
         "libcamfix.dylib",
-        "libvlocation.dylib",
     ]
     static let environmentStaging = "/var/root/Library/Caches/vphone-environment"
 
@@ -134,7 +133,9 @@ extension GuestAPI {
         var buffer = [UInt8](repeating: 0, count: 1024)
         while errorText.count < 4096 {
             let count = read(errorPipe[0], &buffer, min(buffer.count, 4096 - errorText.count))
-            if count <= 0 { break }
+            if count <= 0 {
+                break
+            }
             errorText.append(contentsOf: buffer.prefix(count))
         }
         close(errorPipe[0])

@@ -27,6 +27,7 @@ For any changes applying new patches, also update Research/0_binary_patch_compar
 
 - If working on kernel analysis, symbolication lookups, or kernel patch reasoning, read `Skills/kernel-analysis-vphone600/SKILL.md` first.
 - Use this skill as the default procedure for `vphone600` kernel work.
+- If adding or changing a patch, a patch set, or a preset, read `Skills/authoring-patch-sets/SKILL.md` first. Every patch is declared in a patch set and selected by a preset; a patch in no manifest cannot be turned off and warns on every run.
 
 ## Firmware Mode
 
@@ -48,7 +49,7 @@ See `Research/` for detailed firmware pipeline, component origins, patch breakdo
 - `VPhoneKit`: shared core, archive, and external access kits with their tests.
 - `VPhoneDaemon`: guest `vphoned`, native operations, and daemon configuration.
 - `VPhoneGuestComponents`: guest dylibs built by Makefile from the bundle build phase.
-- `VPhoneLaunchpad`: `vphone-launchpad.app`, the workstation app that downloads and manages `VPhone.bundle` releases and drives VMs through the active bundle's `vphone-cli`, plus its SMJobBless helper `com.vphone.launchpad.helper`. Shipped separately from the bundle. Settings live only in `VPhoneLaunchpad/Configuration/*.xcconfig`; the pbxproj holds none.
+- `VPhoneLaunchpad`: `vphone-launchpad.app`, the workstation app that downloads and manages `VPhone.bundle` releases and drives VMs through the active bundle's `vphone-cli`, plus its SMJobBless helper `com.vphone.launchpad.helper` and `vphone-launchpad-cli`, a stateless client of the running app over a same-user Unix socket (`Documents/Guides/launchpad-cli.md`; use it to install and test a local `VPhone.bundle` build). Shipped separately from the bundle. Settings live only in `VPhoneLaunchpad/Configuration/*.xcconfig`; the pbxproj holds none.
 
 The `VPhone` scheme puts host programs in `VPhone.bundle/Contents/MacOS` and everything installed into the guest (vphoned, guest dylibs, their plists) in `Contents/Resources/guest-resources`. Xcode targets have `CODE_SIGNING_ALLOWED=NO`; the bundle build phase signs each binary ad hoc with only its own entitlements, then seals the outer bundle. `VPhoneVirtualization.entitlements` belongs to `vphone-vm`; `VPhoneDaemon.entitlements` belongs to `vphoned`. The bundle and CLI have no private entitlements.
 
@@ -109,8 +110,8 @@ There is none, and adding any is a regression.
   `Build/ValidateBundle.sh` cannot see.
 - There is no counter-example left. `amfidont` used to be cited as one — a
   third-party tool the user installed into their own Python — and it is gone
-  too: the AMFI allowlist tool is `VPhoneExecutable/VPhoneEscalator`, one C
-  file built by Xcode for arm64e, with no runtime interpreter or LLDB.
+  too: the AMFI allowlist tool is `VPhoneExecutable/VPhoneEscalator`, a few C
+  files built by Xcode for arm64e, with no runtime interpreter or LLDB.
 
 ### Kernel patcher guardrails
 

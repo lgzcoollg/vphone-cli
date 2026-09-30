@@ -6,6 +6,7 @@ root="$(cd "${0:a:h}/../../.." && pwd)"
 bundle="${1:-$root/.build/XcodeBundle/Build/Products/Debug/VPhone.bundle}"
 macos="$bundle/Contents/MacOS"
 resources="$bundle/Contents/Resources"
+frameworks="$bundle/Contents/Frameworks"
 guest="$resources/guest-resources"
 
 file_copy_spawns="$(/usr/bin/find "$root/VPhoneExecutable" "$root/VPhoneKit" \
@@ -36,13 +37,32 @@ require_signed_macho() {
 for name in vphone-vm vphone-cli vphone-escalator libswiftCompatibilitySpan.vphone.dylib; do
     require_signed_macho "$macos/$name"
 done
-for name in vphoned launchdhook-vphone.dylib SystemHook-vphone.dylib libcamfix.dylib libvlocation.dylib \
+require_signed_macho "$frameworks/VPhonePatchKit.framework/Versions/A/VPhonePatchKit"
+# The patch API ships its interface so an out-of-tree patch set can build against
+# the same framework the bundle loads.
+[[ -d "$frameworks/VPhonePatchKit.framework/Versions/A/Modules/VPhonePatchKit.swiftmodule" ]] || {
+    print -u2 "VPhonePatchKit.framework has no Swift module interface"
+    exit 1
+}
+# The presets decide which declared patches apply. A bundle without the standard
+# one would fall back to vphone-cli's built-in copy, so a VM built from a shipped
+# bundle and one built from an Xcode build could get different patches.
+[[ -f "$resources/patches_presets/standard.plist" ]] || {
+    print -u2 "Missing patch preset: patches_presets/standard.plist"
+    exit 1
+}
+for preset in "$resources/patches_presets/"*.plist; do
+    /usr/bin/plutil -lint -s "$preset" || { print -u2 "Malformed patch preset: ${preset:t}"; exit 1; }
+done
+
+for name in vphoned launchdhook-vphone.dylib SystemHook-vphone.dylib libcamfix.dylib \
     libvcamcaptured.dylib libAppleParavirtCompilerPluginIOGPUFamily.dylib; do
     require_signed_macho "$guest/$name"
 done
 for name in vphoned.plist libcamfix.plist libvcamcaptured.plist; do
     [[ -f "$guest/$name" ]] || { print -u2 "Missing guest configuration: $name"; exit 1; }
 done
+[[ ! -e "$guest/libvlocation.dylib" ]] || { print -u2 "Obsolete guest library: libvlocation.dylib"; exit 1; }
 
 for name in vphoned vphoned.signed vphone-app VPhoneAMFIAllow VPhoneEscalator vphone-archive icli vpregister \
     vphone-ask-for-permission libcamfix.dylib libvlocation.dylib libvcamcaptured.dylib launchdhook-vphone.dylib \
@@ -72,11 +92,14 @@ while IFS= read -r file; do
         "$macos/"*)
             [[ "$platform" != IOS ]] || { print -u2 "iOS binary in Contents/MacOS: ${file#$bundle/}"; exit 1; }
             ;;
+        "$frameworks/"*)
+            [[ "$platform" != IOS ]] || { print -u2 "iOS binary in Contents/Frameworks: ${file#$bundle/}"; exit 1; }
+            ;;
         "$guest/"*)
             [[ "$platform" == IOS ]] || { print -u2 "Non-iOS binary in guest-resources: ${file#$bundle/}"; exit 1; }
             ;;
         *)
-            print -u2 "Mach-O outside Contents/MacOS and guest-resources: ${file#$bundle/}"
+            print -u2 "Mach-O outside Contents/MacOS, Contents/Frameworks and guest-resources: ${file#$bundle/}"
             exit 1
             ;;
     esac

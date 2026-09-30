@@ -8,14 +8,32 @@ CLANG := xcrun --sdk iphoneos clang
 GUEST_C_FLAGS := -arch arm64e -miphoneos-version-min=26.0 -Os
 COMMON_FLAGS := $(GUEST_C_FLAGS) -fobjc-arc
 
+# Sources and headers are discovered under a component's folders at any
+# depth, so adding, splitting or nesting files needs no Makefile change.
+# The folders themselves are prerequisites too: their timestamps catch
+# files removed from the discovered inputs.
+find_sources = $(sort $(shell find $(1) -type f \( -name '*.m' -o -name '*.mm' -o -name '*.c' \)))
+find_headers = $(sort $(shell find $(1) -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.inc' \)))
+find_folders = $(sort $(shell find $(1) -type d))
+
+# Both camera dylibs compile the shared data plane and read the frame
+# protocol header, which lives with vcamcaptured. Headers resolve through
+# -I, never through relative paths.
+VCAM_SHARED_DIRS := VCamDataPlane
+VCAM_HEADER_DIRS := VCamDataPlane VCamCaptured
+
 CAMFIX := $(STAGE)/camfix/libcamfix.dylib
-CAMFIX_SOURCES := $(wildcard CamFix/*.m)
-CAMFIX_INCLUDES := $(wildcard CamFix/*.h CamFix/*.inc VCamCaptured/*.h)
-LOCATIONFIX := $(STAGE)/locationfix/libvlocation.dylib
-LOCATIONFIX_SOURCES := $(wildcard LocationFix/*.m)
+CAMFIX_DIRS := CamFix $(VCAM_SHARED_DIRS)
+CAMFIX_SOURCES := $(call find_sources,$(CAMFIX_DIRS))
+CAMFIX_INPUTS := $(call find_headers,CamFix $(VCAM_HEADER_DIRS)) \
+	$(call find_folders,CamFix $(VCAM_HEADER_DIRS))
+CAMFIX_INCLUDE_FLAGS := $(addprefix -I,$(call find_folders,CamFix) $(VCAM_HEADER_DIRS))
 VCAMCAPTURED := $(STAGE)/vcamcaptured/libvcamcaptured.dylib
-VCAMCAPTURED_SOURCES := $(wildcard VCamCaptured/*.m)
-VCAMCAPTURED_INCLUDES := $(wildcard VCamCaptured/*.h VCamCaptured/*.inc)
+VCAMCAPTURED_DIRS := VCamCaptured $(VCAM_SHARED_DIRS)
+VCAMCAPTURED_SOURCES := $(call find_sources,$(VCAMCAPTURED_DIRS))
+VCAMCAPTURED_INPUTS := $(call find_headers,$(VCAM_HEADER_DIRS)) \
+	$(call find_folders,$(VCAM_HEADER_DIRS))
+VCAMCAPTURED_INCLUDE_FLAGS := $(addprefix -I,$(call find_folders,VCamCaptured) $(VCAM_SHARED_DIRS))
 LAUNCHHOOK := $(STAGE)/launchhook/launchdhook-vphone.dylib
 LAUNCHHOOK_SOURCES := $(wildcard LaunchHook/*.c) Shared/RootHideLoaderLinks.c
 LAUNCHHOOK_INCLUDES := $(wildcard LaunchHook/*.h LaunchHook/*.inc Shared/*.h)
@@ -49,7 +67,7 @@ GPU_DYNAMIC_LOOKUP_SYMS := \
 	-Wl,-U,_MTLMetalFunctionCreate \
 	-Wl,-U,_MTLMetalLibInsertFunction \
 	-Wl,-U,_MTLWriteMetalLibToMemoryBuffer
-ARTIFACTS := $(CAMFIX) $(LOCATIONFIX) $(VCAMCAPTURED) $(LAUNCHHOOK) $(SYSTEMHOOK) $(GPU_PLUGIN)
+ARTIFACTS := $(CAMFIX) $(VCAMCAPTURED) $(LAUNCHHOOK) $(SYSTEMHOOK) $(GPU_PLUGIN)
 PLISTS := $(STAGE)/camfix/libcamfix.plist $(STAGE)/vcamcaptured/libvcamcaptured.plist
 GPU_PROVENANCE := $(STAGE)/gpu/README.md
 
@@ -63,7 +81,7 @@ gpu: $(GPU_PLUGIN)
 
 package: all
 	@rm -f $(ARCHIVE)
-	@/usr/bin/tar -cf $(ARCHIVE) -C $(STAGE) camfix locationfix vcamcaptured launchhook systemhook gpu
+	@/usr/bin/tar -cf $(ARCHIVE) -C $(STAGE) camfix vcamcaptured launchhook systemhook gpu
 	@echo "Packaged $(ARCHIVE)"
 
 test-loader-links:
@@ -76,17 +94,18 @@ test-loader-links:
 test-vcam-dataplane:
 	@mkdir -p $(OUT)
 	xcrun --sdk macosx clang -O1 -Wall -Wextra -Werror -Wno-unused-parameter \
+		$(addprefix -I,$(VCAM_SHARED_DIRS)) \
 		-o $(OUT)/VCamDataPlaneTests \
-		Tests/VCamDataPlaneTests.c VCamDataPlane/vcam_dataplane.c \
+		Tests/VCamDataPlaneTests.c $(call find_sources,$(VCAM_SHARED_DIRS)) \
 		-framework CoreMedia -framework CoreVideo -framework CoreFoundation \
 		-framework CoreGraphics
 	@$(OUT)/VCamDataPlaneTests
 
-$(STAGE)/camfix $(STAGE)/locationfix $(STAGE)/vcamcaptured $(STAGE)/launchhook $(STAGE)/systemhook $(STAGE)/gpu:
+$(STAGE)/camfix $(STAGE)/vcamcaptured $(STAGE)/launchhook $(STAGE)/systemhook $(STAGE)/gpu:
 	@mkdir -p $@
 
-$(CAMFIX): $(CAMFIX_SOURCES) $(CAMFIX_INCLUDES) CamFix VCamCaptured | $(STAGE)/camfix
-	$(CLANG) $(COMMON_FLAGS) -dynamiclib \
+$(CAMFIX): $(CAMFIX_SOURCES) $(CAMFIX_INPUTS) | $(STAGE)/camfix
+	$(CLANG) $(COMMON_FLAGS) $(CAMFIX_INCLUDE_FLAGS) -dynamiclib \
 		-install_name @rpath/libcamfix.dylib \
 		-o $@ $(CAMFIX_SOURCES) \
 		-framework Foundation -framework AVFoundation -framework ImageIO \
@@ -94,18 +113,12 @@ $(CAMFIX): $(CAMFIX_SOURCES) $(CAMFIX_INCLUDES) CamFix VCamCaptured | $(STAGE)/c
 		-framework CoreGraphics -framework QuartzCore
 	@codesign --force --sign - $@
 
-$(LOCATIONFIX): $(LOCATIONFIX_SOURCES) LocationFix | $(STAGE)/locationfix
-	$(CLANG) $(COMMON_FLAGS) -dynamiclib \
-		-install_name /usr/lib/libvlocation.dylib \
-		-o $@ $(LOCATIONFIX_SOURCES) \
-		-framework Foundation -framework CoreLocation
-	@codesign --force --sign - $@
-
-$(VCAMCAPTURED): $(VCAMCAPTURED_SOURCES) $(VCAMCAPTURED_INCLUDES) VCamCaptured | $(STAGE)/vcamcaptured
-	$(CLANG) $(COMMON_FLAGS) -dynamiclib \
+$(VCAMCAPTURED): $(VCAMCAPTURED_SOURCES) $(VCAMCAPTURED_INPUTS) | $(STAGE)/vcamcaptured
+	$(CLANG) $(COMMON_FLAGS) $(VCAMCAPTURED_INCLUDE_FLAGS) -dynamiclib \
 		-install_name @rpath/libvcamcaptured.dylib \
 		-o $@ $(VCAMCAPTURED_SOURCES) \
-		-framework Foundation -framework CoreMedia -framework CoreVideo
+		-framework Foundation -framework CoreMedia -framework CoreVideo \
+		-framework CoreGraphics
 	@codesign --force --sign - $@
 
 $(LAUNCHHOOK): $(LAUNCHHOOK_SOURCES) $(LAUNCHHOOK_INCLUDES) LaunchHook Shared | $(STAGE)/launchhook

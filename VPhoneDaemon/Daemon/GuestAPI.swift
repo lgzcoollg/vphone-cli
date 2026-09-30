@@ -40,10 +40,19 @@ enum GuestAPI {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// The address the host shows for the guest, from icli's
+    /// `"<interface> <address>"` strings: a 192.x IPv4 address (the NAT
+    /// network), then any other routable IPv4, then a routable IPv6. Loopback
+    /// and link-local addresses, which sort first, never qualify.
+    static func preferredAddress(_ addresses: [String]) -> String? {
+        let hosts = addresses.compactMap { $0.split(separator: " ", maxSplits: 1).last.map(String.init) }
+        let ipv4 = hosts.filter { !$0.contains(":") && !$0.hasPrefix("127.") && !$0.hasPrefix("169.254.") }
+        let ipv6 = hosts.filter { $0.contains(":") && $0 != "::1" && !$0.contains("%") && !$0.hasPrefix("fe80:") }
+        return ipv4.first { $0.hasPrefix("192.") } ?? ipv4.first ?? ipv6.first
+    }
+
     static func health() -> [String: Any] {
-        let addresses = networkInfo()["addresses"] as? [String] ?? []
-        let ip = addresses.first(where: { $0.hasPrefix("en") && !$0.contains("127.0.0.1") })?
-            .split(separator: " ").last.map(String.init)
+        let ip = preferredAddress(networkInfo()["addresses"] as? [String] ?? [])
         let version = ProcessInfo.processInfo.operatingSystemVersion
         return [
             "name": "vphoned",
@@ -70,6 +79,7 @@ enum GuestAPI {
                 "screenshot",
                 "device_info",
                 "display",
+                "display_orientation",
                 "audio",
                 "input_gestures",
                 "ui_inspection",
@@ -80,6 +90,7 @@ enum GuestAPI {
                 "app_details",
                 "system_control",
                 "file_tools",
+                "files_app_drop",
                 "packages",
                 "environment_update",
             ],
@@ -264,19 +275,19 @@ enum GuestAPI {
             }
             return try hidPress(page: page, usage: usage)
         case "location.set":
-            return try GuestLocationSimulation.set(.init(
+            return try simulateLocation(
                 latitude: number(params, "latitude"),
                 longitude: number(params, "longitude"),
                 altitude: number(params, "altitude", default: 0),
                 horizontalAccuracy: number(params, "horizontal_accuracy", default: 5),
                 verticalAccuracy: number(params, "vertical_accuracy", default: 5),
-                speed: (params["speed"] as? NSNumber)?.doubleValue ?? -1,
-                course: (params["course"] as? NSNumber)?.doubleValue ?? -1,
-            ))
+                speed: (params["speed"] as? NSNumber)?.doubleValue,
+                course: (params["course"] as? NSNumber)?.doubleValue,
+            )
         case "location.clear":
-            return try GuestLocationSimulation.clear()
+            return try clearSimulatedLocation()
         case "location.current":
-            return try GuestLocationSimulation.current(timeout: number(params, "timeout", default: 10))
+            return try currentLocation(timeout: number(params, "timeout", default: 10))
         case "developer_mode.status":
             return try developerModeStatus()
         case "developer_mode.enable":
@@ -350,7 +361,7 @@ enum GuestAPI {
             let next = cache + ".next"
             let data = try Data(contentsOf: URL(fileURLWithPath: next), options: .mappedIfSafe)
             let actual = sha256Hex(data)
-            guard actual == expected else { throw GuestAPIError.invalidRequest("Update hash mismatch") }
+            guard actual == expected else { throw GuestAPIError.invalidRequest("The update is damaged. Try again.") }
             guard chmod(next, 0o755) == 0 else {
                 throw GuestAPIError.operationFailed("Could not make update executable")
             }

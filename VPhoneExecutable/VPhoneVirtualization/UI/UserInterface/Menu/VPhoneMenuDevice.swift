@@ -1,15 +1,18 @@
 import AppKit
 import LocalAuthentication
+import VPhoneCoreKit
 
 // MARK: - Device Menu
 
-/// Hardware the guest thinks it has: buttons, keyboard, sensors and the
-/// host-side overrides that feed them.
+/// The phone's buttons and input, and restarting it. Sensor overrides live
+/// in the Features menu.
 extension VPhoneMenuController {
     func buildDeviceMenu() -> NSMenuItem {
         let item = NSMenuItem(title: "Device", action: nil, keyEquivalent: "")
         let menu = NSMenu(title: "Device")
         menu.autoenablesItems = false
+        menu.addItem(makePanelItem(.controls, "Controls", keyEquivalent: "k", symbol: "slider.horizontal.3"))
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(makeItem(
             "Home Screen",
             action: #selector(sendHome),
@@ -21,17 +24,32 @@ extension VPhoneMenuController {
         menu.addItem(makeItem("Volume Up", action: #selector(sendVolumeUp), symbol: "speaker.plus"))
         menu.addItem(makeItem("Volume Down", action: #selector(sendVolumeDown), symbol: "speaker.minus"))
         menu.addItem(NSMenuItem.separator())
-        let restart = makeItem("Restart Guest…", action: #selector(restartGuest), symbol: "arrow.clockwise")
-        restart.isEnabled = false
-        restartGuestItem = restart
-        menu.addItem(restart)
+        let rotateLeft = makeItem(
+            "Rotate Left",
+            action: #selector(rotateLeft),
+            keyEquivalent: String(UnicodeScalar(NSLeftArrowFunctionKey)!),
+            symbol: "rotate.left",
+        )
+        let rotateRight = makeItem(
+            "Rotate Right",
+            action: #selector(rotateRight),
+            keyEquivalent: String(UnicodeScalar(NSRightArrowFunctionKey)!),
+            symbol: "rotate.right",
+        )
+        let orientationItem = NSMenuItem(title: "Orientation", action: nil, keyEquivalent: "")
+        orientationItem.image = menuSymbol("rectangle.portrait.rotate")
+        orientationItem.submenu = buildOrientationMenu()
+        // Disabled until the agent connects, so ⌘← and ⌘→ reach the guest.
+        for rotate in [rotateLeft, rotateRight, orientationItem] {
+            rotate.isEnabled = false
+            menu.addItem(rotate)
+        }
+        rotateMenuItems = [rotateLeft, rotateRight, orientationItem]
+        control.observeInterfaceOrientation { [weak self] orientation in
+            self?.updateOrientationChecks(orientation)
+        }
         menu.addItem(NSMenuItem.separator())
         menu.addItem(makeItem("Open Guest Spotlight", action: #selector(sendSpotlight), symbol: "magnifyingglass"))
-        menu.addItem(makeItem(
-            "Type ASCII from Mac Clipboard",
-            action: #selector(typeFromClipboard),
-            symbol: "keyboard",
-        ))
         // Trackpad scroll and pinch arrive as ordinary NSEvents; the view turns
         // them into guest touches. Off hands both back to AppKit untouched.
         let trackpadItem = makeItem(
@@ -42,13 +60,6 @@ extension VPhoneMenuController {
         trackpadItem.state = VPhoneTrackpadGestures.isEnabled ? .on : .off
         trackpadGesturesItem = trackpadItem
         menu.addItem(trackpadItem)
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(makePanelItem(.controls, "Controls", keyEquivalent: "k", symbol: "slider.horizontal.3"))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(buildLocationSubmenu())
-        menu.addItem(buildBatterySubmenu())
-        menu.addItem(buildCameraSubmenu())
-        menu.addItem(NSMenuItem.separator())
         let tidItem = makeItem("Touch ID Home Forwarding", action: #selector(toggleTouchIDForwarding))
         if hasTouchID {
             let tidEnabled = !UserDefaults.standard.bool(forKey: "touchIDForwardingDisabled")
@@ -59,6 +70,11 @@ extension VPhoneMenuController {
         }
         touchIDMenuItem = tidItem
         menu.addItem(tidItem)
+        menu.addItem(NSMenuItem.separator())
+        let restart = makeItem("Restart Guest…", action: #selector(restartGuest), symbol: "arrow.clockwise")
+        restart.isEnabled = false
+        restartGuestItem = restart
+        menu.addItem(restart)
         item.submenu = menu
         return item
     }
@@ -83,8 +99,75 @@ extension VPhoneMenuController {
         keySender.sendSpotlight()
     }
 
-    @objc func typeFromClipboard() {
-        keySender.typeFromClipboard()
+    // MARK: - Rotate
+
+    /// The four interface orientations, checked by the one the window last
+    /// read from the guest.
+    private func buildOrientationMenu() -> NSMenu {
+        let menu = NSMenu(title: "Orientation")
+        let orientations: [(VPhoneDisplayOrientation, String)] = [
+            (.portrait, "Portrait"),
+            (.landscapeLeft, "Landscape Left"),
+            (.landscapeRight, "Landscape Right"),
+            (.upsideDown, "Upside Down"),
+        ]
+        for (orientation, title) in orientations {
+            let item = makeItem(title, action: #selector(chooseOrientation(_:)))
+            item.representedObject = orientation.rawValue
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    private func updateOrientationChecks(_ orientation: VPhoneDisplayOrientation?) {
+        guard let menu = rotateMenuItems.last?.submenu else { return }
+        for item in menu.items {
+            item.state = (item.representedObject as? Int) == orientation?.rawValue ? .on : .off
+        }
+    }
+
+    @objc func chooseOrientation(_ sender: NSMenuItem) {
+        guard let degrees = sender.representedObject as? Int,
+              let orientation = VPhoneDisplayOrientation(degrees: degrees)
+        else { return }
+        Task {
+            do {
+                try await control.rotate(toFirstOf: [orientation])
+            } catch {
+                VPhoneAlert.present(
+                    title: "Unable to Rotate",
+                    message: "The app in front does not support this orientation.",
+                    style: .warning,
+                )
+            }
+        }
+    }
+
+    @objc func rotateLeft() {
+        rotate(clockwise: false)
+    }
+
+    @objc func rotateRight() {
+        rotate(clockwise: true)
+    }
+
+    /// Turns the guest a quarter turn from its interface orientation, the
+    /// one already turning to when pressed again. An orientation the app in
+    /// front refuses, such as upside down on the Home Screen, is skipped for
+    /// the one after it. The window turns with the guest.
+    private func rotate(clockwise: Bool) {
+        Task {
+            var current = control.interfaceOrientation
+            if current == nil {
+                let method = control.guestCapabilities.contains("display_orientation")
+                    ? "display.orientation" : "display.rotation"
+                let degrees = try? await (control.call(method)["degrees"] as? NSNumber)?.intValue
+                current = degrees.flatMap(VPhoneDisplayOrientation.init(degrees:))
+            }
+            guard let current else { return }
+            let next = current.turned(clockwise: clockwise)
+            try? await control.rotate(toFirstOf: [next, next.turned(clockwise: clockwise)])
+        }
     }
 
     /// Replays trackpad scroll and pinch inside the guest instead of letting

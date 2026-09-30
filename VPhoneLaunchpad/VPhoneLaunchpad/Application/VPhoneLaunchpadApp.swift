@@ -5,17 +5,32 @@ import SwiftUI
 struct VPhoneLaunchpadApp: App {
     @NSApplicationDelegateAdaptor(VPhoneLaunchpadAppDelegate.self) private var delegate
     @State private var model = VPhoneLaunchpadModel()
+    @AppStorage(VPhoneLaunchpadMenuBar.key) private var showsInMenuBar = false
 
     var body: some Scene {
         Window(Text(verbatim: "vphone-launchpad"), id: "main") {
             VPhoneLaunchpadRootView()
                 .environment(model)
-                .frame(minWidth: 820, minHeight: 560)
                 .onAppear { delegate.model = model }
         }
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .appSettings) {
+                Button("Host Setup…") { model.present(.hostSetup) }
+                Button("Core Bundle…") { model.present(.coreBundle) }
+            }
+        }
+
+        MenuBarExtra(isInserted: $showsInMenuBar) {
+            VPhoneLaunchpadMenuBarMenu()
+                .environment(model)
+        } label: {
+            Label {
+                Text(verbatim: "vphone-launchpad")
+            } icon: {
+                Image(systemName: "iphone")
+            }
         }
     }
 }
@@ -26,9 +41,15 @@ struct VPhoneLaunchpadApp: App {
 @MainActor
 final class VPhoneLaunchpadAppDelegate: NSObject, NSApplicationDelegate {
     weak var model: VPhoneLaunchpadModel?
+    private let dockPolicy = VPhoneLaunchpadDockPolicy()
 
+    func applicationDidFinishLaunching(_: Notification) {
+        dockPolicy.start()
+    }
+
+    /// In menu bar mode the app stays behind in the menu bar.
     func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool {
-        true
+        !VPhoneLaunchpadMenuBar.isEnabled
     }
 
     func applicationShouldTerminate(_: NSApplication) -> NSApplication.TerminateReply {
