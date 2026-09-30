@@ -386,7 +386,6 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
 
         readSource.resume()
         connections[flow.key] = connection
-        Self.log.info("connect \(flow.destinationAddress):\(flow.destinationPort) from :\(flow.sourcePort)")
     }
 
     private func finishConnect(_ connection: Connection) {
@@ -425,8 +424,6 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                 connection.sentNotAcked.removeFirst(drop)
                 connection.sentNotAckedSequence &+= UInt32(drop)
             }
-            let room = Int(Int32(bitPattern: connection.sendWindowRight &- connection.localSequence))
-            Self.log.debug("ack \(segment.acknowledgmentNumber, privacy: .public) window \(segment.windowSize, privacy: .public) room \(room, privacy: .public) queued \(connection.pendingToGuest.count, privacy: .public)")
             flushToGuest(connection)
         }
 
@@ -622,8 +619,6 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                 connection.lastActivity = Date()
                 connection.pendingToGuest += buffer[0 ..< received]
                 flushToGuest(connection)
-                let room = Int(Int32(bitPattern: connection.sendWindowRight &- connection.localSequence))
-                Self.log.debug("host -> \(received, privacy: .public)B read; \(connection.pendingToGuest.count, privacy: .public)B still queued, window room \(room, privacy: .public)")
                 if connection.pendingToGuest.count >= Self.maxPendingToGuest { break }
                 continue
             }
@@ -662,9 +657,6 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             advertisedMSS: Self.ourMSS,
             advertisedWindowScale: connection.windowScaleNegotiated ? Self.ourWindowScaleShift : nil,
         ), connection: connection)
-        Self.log.info(
-            "handshake: SYN-ACK out, guest MSS \(connection.peerMSS, privacy: .public), window scale \(connection.windowScaleNegotiated ? Self.ourWindowScaleShift : 0, privacy: .public)",
-        )
     }
 
     private func sendAcknowledgment(_ connection: Connection) {
@@ -760,7 +752,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         connection.isClosed = true
         let lifetime = Date().timeIntervalSince(connection.openedAt)
         let sinceAck = Date().timeIntervalSince(connection.lastAckAdvance)
-        Self.log.info(
+        Self.log.debug(
             "\(connection.flow.destinationAddress, privacy: .public):\(connection.flow.destinationPort, privacy: .public) <- :\(connection.flow.sourcePort, privacy: .public) closed after \(String(format: "%.1f", lifetime), privacy: .public)s  up \(connection.bytesToHost, privacy: .public)B  down \(connection.bytesToGuest, privacy: .public)B  unacked \(connection.unacknowledgedBytes, privacy: .public)B  lastAck \(String(format: "%.1f", sinceAck), privacy: .public)s ago",
         )
         close(connection)
