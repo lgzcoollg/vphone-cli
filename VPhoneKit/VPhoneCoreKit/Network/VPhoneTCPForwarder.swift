@@ -138,6 +138,19 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         /// to be suspended or it spins.
         var readSuspended = false
 
+        // MARK: Sending toward the host
+        //
+        // The mirror of the problem above: the host's send buffer can fill too,
+        // when the guest uploads faster than the server accepts. Waiting for
+        // writability is the only correct response; retrying in a loop would hold
+        // the serial queue and stall every other connection with it.
+
+        /// Guest payload not yet written to the host, waiting on its send buffer.
+        var pendingToHost: [UInt8] = []
+        /// Set once we have told the guest our window is shut, so a window update
+        /// follows the moment the backlog clears.
+        var guestWindowClosed = false
+
         init(flow: VPhoneTCPFlow, socket: Int32, readSource: DispatchSourceRead, state: State, localSequence: UInt32, remoteSequence: UInt32, peerMSS: Int) {
             self.flow = flow
             self.socket = socket
@@ -365,7 +378,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                     sequenceNumber: connection.localSequence,
                     acknowledgmentNumber: connection.remoteSequence,
                     flags: VPhoneTCPFlags.ack,
-                    windowSize: Self.advertisedWindow,
+                    windowSize: advertisedWindowSize(connection),
                 ), connection: connection)
             } else {
                 // Already seen (a duplicate) or out of order. The link to us is a
@@ -377,7 +390,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                     sequenceNumber: connection.localSequence,
                     acknowledgmentNumber: connection.remoteSequence,
                     flags: VPhoneTCPFlags.ack,
-                    windowSize: Self.advertisedWindow,
+                    windowSize: advertisedWindowSize(connection),
                 ), connection: connection)
             }
         }
@@ -421,7 +434,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                 sequenceNumber: connection.localSequence,
                 acknowledgmentNumber: connection.remoteSequence,
                 flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.psh,
-                windowSize: Self.advertisedWindow,
+                windowSize: advertisedWindowSize(connection),
                 payload: data,
             ), connection: connection)
         }
@@ -434,7 +447,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                 sequenceNumber: connection.localSequence,
                 acknowledgmentNumber: connection.remoteSequence,
                 flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.fin,
-                windowSize: Self.advertisedWindow,
+                windowSize: advertisedWindowSize(connection),
             ), connection: connection)
             finishIfBothClosed(connection)
             if connection.state == .closing, connection.pendingToGuest.isEmpty { return }
@@ -456,26 +469,62 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     }
 
     private func writeToHost(_ payload: [UInt8], connection: Connection) {
-        var offset = 0
-        while offset < payload.count {
-            let written = payload.withUnsafeBytes { raw -> Int in
+        connection.pendingToHost += payload
+        flushToHost(connection)
+    }
+
+    /// Write what we can toward the host, then wait for writability.
+    ///
+    /// The previous version retried on EAGAIN in a tight loop. That is not a slow
+    /// path, it is a hang: the loop never yields, so the serial queue it runs on
+    /// stops serving every other connection -- downloads included -- and the CPU
+    /// spins until the host's buffer drains.
+    private func flushToHost(_ connection: Connection) {
+        while !connection.pendingToHost.isEmpty {
+            let written = connection.pendingToHost.withUnsafeBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
-                return Darwin.send(connection.socket, base + offset, raw.count - offset, 0)
+                return Darwin.send(connection.socket, base, raw.count, 0)
             }
             if written > 0 {
-                offset += written
-            } else if written < 0, errno == EAGAIN || errno == EINTR {
-                // The host's send buffer is full. The guest-facing link is local
-                // and we advertise a fixed window, so this is transient; retrying
-                // the remainder keeps ordering intact.
+                connection.pendingToHost.removeFirst(written)
                 continue
-            } else {
-                sendReset(for: connection.flow, inReplyTo: nil)
-                close(connection)
-                connections[connection.flow.key] = nil
+            }
+            if written < 0, errno == EAGAIN || errno == EINTR {
+                // Full. Arm a write source and come back when there is room.
+                connection.guestWindowClosed = true
+                if connection.writeSource == nil {
+                    let source = DispatchSource.makeWriteSource(fileDescriptor: connection.socket, queue: queue)
+                    source.setEventHandler { [weak self] in self?.flushToHost(connection) }
+                    source.resume()
+                    connection.writeSource = source
+                }
                 return
             }
+            sendReset(for: connection.flow, inReplyTo: nil)
+            close(connection)
+            connections[connection.flow.key] = nil
+            return
         }
+
+        // Backlog cleared: stop watching for writability, and reopen the window
+        // if the guest was told it had shut.
+        if let source = connection.writeSource {
+            source.cancel()
+            connection.writeSource = nil
+        }
+        if connection.guestWindowClosed {
+            connection.guestWindowClosed = false
+            sendAcknowledgment(connection)
+        }
+    }
+
+    /// The window we advertise to the guest.
+    ///
+    /// Shut while data is still queued toward the host, so the guest stops
+    /// sending instead of piling more into a queue that cannot drain. A window
+    /// update goes out once the backlog clears (see `flushToHost`).
+    private func advertisedWindowSize(_ connection: Connection) -> UInt16 {
+        connection.pendingToHost.isEmpty ? Self.advertisedWindow : 0
     }
 
     // MARK: - Host to guest
@@ -501,6 +550,8 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                 connection.lastActivity = Date()
                 connection.pendingToGuest += buffer[0 ..< received]
                 flushToGuest(connection)
+                let room = Int(Int32(bitPattern: connection.sendWindowRight &- connection.localSequence))
+                Self.log.debug("host -> \(received, privacy: .public)B read; \(connection.pendingToGuest.count, privacy: .public)B still queued, window room \(room, privacy: .public)")
                 if connection.pendingToGuest.count >= Self.maxPendingToGuest { break }
                 continue
             }
@@ -535,7 +586,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             sequenceNumber: connection.localSequence,
             acknowledgmentNumber: connection.remoteSequence,
             flags: VPhoneTCPFlags.syn | VPhoneTCPFlags.ack,
-            windowSize: Self.advertisedWindow,
+            windowSize: advertisedWindowSize(connection),
             advertisedMSS: Self.ourMSS,
         ), connection: connection)
         Self.log.info("handshake: SYN-ACK out, guest MSS \(connection.peerMSS)")
@@ -548,7 +599,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             sequenceNumber: connection.localSequence,
             acknowledgmentNumber: connection.remoteSequence,
             flags: VPhoneTCPFlags.ack,
-            windowSize: Self.advertisedWindow,
+            windowSize: advertisedWindowSize(connection),
         ), connection: connection)
     }
 
