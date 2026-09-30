@@ -20,8 +20,10 @@ extension VPhoneMenuController {
             modifiers: [.command, .shift],
             symbol: "house",
         ))
-        // iOS has no back key, so Esc and this item both replay the system back
-        // gesture. No modifier: plain Esc is what the key is for.
+        // iOS has no back key, so this item and the Esc key both replay the
+        // system back gesture. The key equivalent is here so the menu can show
+        // it; VPhoneApplication intercepts Esc before the menu is consulted,
+        // because AppKit's matching for a bare Esc missed presses.
         menu.addItem(makeItem(
             "Back",
             action: #selector(sendBack),

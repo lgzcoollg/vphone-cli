@@ -657,10 +657,24 @@ class VPhoneVirtualMachineView: VZVirtualMachineView {
     /// ordinary mouse events, so the touch follows whichever injection path the
     /// running base uses (vphoned on iOS 18, the native VZ multitouch path on
     /// 26 and later).
+    /// True while a back swipe is in flight. A second press during one cannot
+    /// stack another gesture on top of it, which is what made a double press
+    /// look like nothing happened.
+    private var backGestureInFlight = false
+
     func performBackGesture() {
-        guard let display = recordingGraphicsDisplay else { return }
+        guard !backGestureInFlight, let display = recordingGraphicsDisplay else { return }
         let size = display.sizeInPixels
         guard size.width > 0, size.height > 0 else { return }
+
+        backGestureInFlight = true
+        let durationMS = 250
+        // The swipe queues its steps on the main queue too, so clearing the flag
+        // from there after the last step keeps the two in order.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double(durationMS) / 1000 + 0.05) {
+            [weak self] in
+            self?.backGestureInFlight = false
+        }
 
         injectSwipe(
             fromX: size.width * 0.004,
@@ -669,7 +683,7 @@ class VPhoneVirtualMachineView: VZVirtualMachineView {
             toY: size.height * 0.5,
             screenWidth: Int(size.width),
             screenHeight: Int(size.height),
-            durationMs: 320,
+            durationMs: durationMS,
         )
     }
 
