@@ -189,6 +189,9 @@ enum VPhoneUserspaceNetworkOutcome {
     /// The frame is a UDP payload for somewhere beyond the guest; the forwarder
     /// owns the answer, which arrives later.
     case forward(flow: VPhoneUDPFlow, payload: [UInt8])
+    /// The frame is a TCP segment. TCP is terminated rather than relayed, so the
+    /// forwarder keeps the connection and emits segments of its own.
+    case forwardTCP(flow: VPhoneTCPFlow, segment: VPhoneTCPSegment)
     /// Nothing to say.
     case drop
 }
@@ -261,6 +264,8 @@ final class VPhoneUserspaceNetworkResponder {
             return respondToICMP(packet).map { .reply($0) } ?? .drop
         case .udp:
             return respondToUDP(packet)
+        case .tcp:
+            return respondToTCP(packet)
         }
     }
 
@@ -350,6 +355,30 @@ final class VPhoneUserspaceNetworkResponder {
             payload: replyDatagram.bytes(source: configuration.hostAddress, destination: .broadcast),
         )
         return encapsulate(wrapped.bytes, destinationMAC: broadcastMAC)
+    }
+
+    // MARK: - TCP
+
+    /// Hand the segment to the TCP forwarder, which terminates it.
+    ///
+    /// Unlike UDP there is no local case to answer here: every guest segment
+    /// belongs to a connection the forwarder owns, and it emits whatever comes
+    /// back. A segment we cannot attribute to a guest MAC is dropped, since a
+    /// reply could not be addressed.
+    private func respondToTCP(_ packet: VPhoneIPv4Packet) -> VPhoneUserspaceNetworkOutcome {
+        guard let segment = VPhoneTCPSegment(bytes: packet.payload),
+              let guestMAC, packet.source != .any
+        else { return .drop }
+        return .forwardTCP(
+            flow: VPhoneTCPFlow(
+                sourceAddress: packet.source,
+                sourcePort: segment.sourcePort,
+                destinationAddress: packet.destination,
+                destinationPort: segment.destinationPort,
+                guestHardware: guestMAC,
+            ),
+            segment: segment,
+        )
     }
 
     // MARK: - Framing

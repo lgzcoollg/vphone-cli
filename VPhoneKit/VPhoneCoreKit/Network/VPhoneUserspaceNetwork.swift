@@ -56,6 +56,9 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     /// Carries the guest's UDP out to the host and the answers back. Owns one
     /// socket per flow, so it is the thing `stop()` has to tear down.
     private let forwarder: VPhoneUDPForwarder
+    /// Terminates the guest's TCP against host sockets. Owns one connection per
+    /// flow, and emits segments of its own rather than echoing ours.
+    private let tcpForwarder: VPhoneTCPForwarder
 
     /// Largest frame we will accept from the guest. Ethernet header plus a
     /// jumbo-sized IP packet; the guest is expected to stay within `mtu`.
@@ -89,6 +92,9 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
         forwarder = VPhoneUDPForwarder(configuration: configuration, queue: queue) { [weak self] flow, payload in
             self?.sendUDPReply(flow: flow, payload: payload)
         }
+        tcpForwarder = VPhoneTCPForwarder(queue: queue) { [weak self] flow, segment in
+            self?.sendTCPReply(flow: flow, segment: segment)
+        }
     }
 
     /// The object to hand to `VZVirtioNetworkDeviceConfiguration.attachment`.
@@ -107,6 +113,7 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             source.resume()
             self.source = source
             forwarder.start()
+            tcpForwarder.start()
         }
     }
 
@@ -119,6 +126,7 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             source?.cancel()
             source = nil
             forwarder.stop()
+            tcpForwarder.stop()
         }
     }
 
@@ -146,6 +154,8 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             case let .forward(flow, payload):
                 // The answer arrives later, on this same queue.
                 forwarder.send(payload, for: flow)
+            case let .forwardTCP(flow, segment):
+                tcpForwarder.receive(segment, for: flow)
             }
         }
     }
@@ -162,6 +172,26 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     /// The source address is the guest's *destination*, not our gateway address:
     /// a DNS lookup was addressed to `192.168.127.1`, so the answer has to
     /// appear to come from there or the guest's stack will discard it.
+    /// Wrap one TCP segment the forwarder produced.
+    ///
+    /// Same addressing rule as UDP: the source is what the guest believes it is
+    /// talking to, not our gateway address, or the guest's stack drops the
+    /// segment before its TCP ever sees it.
+    private func sendTCPReply(flow: VPhoneTCPFlow, segment: VPhoneTCPSegment) {
+        let packet = VPhoneIPv4Packet(
+            source: flow.destinationAddress,
+            destination: flow.sourceAddress,
+            proto: .tcp,
+            payload: segment.bytes(source: flow.destinationAddress, destination: flow.sourceAddress),
+        )
+        write(VPhoneEthernetFrame(
+            destination: flow.guestHardware,
+            source: .gateway,
+            etherType: .ipv4,
+            payload: packet.bytes,
+        ).bytes)
+    }
+
     private func sendUDPReply(flow: VPhoneUDPFlow, payload: [UInt8]) {
         let datagram = VPhoneUDPDatagram(
             sourcePort: flow.destinationPort,

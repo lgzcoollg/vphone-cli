@@ -127,6 +127,7 @@ struct VPhoneEthernetFrame {
 
 enum VPhoneIPProtocol: UInt8 {
     case icmp = 1
+    case tcp = 6
     case udp = 17
 }
 
@@ -248,5 +249,101 @@ extension VPhoneInternetChecksum {
         sum += UInt32(proto)
         sum += UInt32(length)
         return sum
+    }
+}
+
+// MARK: - TCP
+
+/// The control bits this stack looks at, as they appear in the segment's flags
+/// byte.
+enum VPhoneTCPFlags {
+    static let fin: UInt8 = 0x01
+    static let syn: UInt8 = 0x02
+    static let rst: UInt8 = 0x04
+    static let psh: UInt8 = 0x08
+    static let ack: UInt8 = 0x10
+}
+
+/// A TCP segment, header and payload.
+///
+/// Only the fields this stack needs. Incoming options are parsed past but not
+/// retained: a guest is free to send SACK-permitted or a timestamp, and the
+/// correct response from a peer that never offered them is to ignore them —
+/// which is what discarding them amounts to. We never send options.
+struct VPhoneTCPSegment {
+    var sourcePort: UInt16
+    var destinationPort: UInt16
+    var sequenceNumber: UInt32
+    var acknowledgmentNumber: UInt32
+    var flags: UInt8
+    var windowSize: UInt16
+    var payload: [UInt8]
+
+    init(
+        sourcePort: UInt16,
+        destinationPort: UInt16,
+        sequenceNumber: UInt32,
+        acknowledgmentNumber: UInt32,
+        flags: UInt8,
+        windowSize: UInt16,
+        payload: [UInt8] = [],
+    ) {
+        self.sourcePort = sourcePort
+        self.destinationPort = destinationPort
+        self.sequenceNumber = sequenceNumber
+        self.acknowledgmentNumber = acknowledgmentNumber
+        self.flags = flags
+        self.windowSize = windowSize
+        self.payload = payload
+    }
+
+    var hasSYN: Bool { flags & VPhoneTCPFlags.syn != 0 }
+    var hasACK: Bool { flags & VPhoneTCPFlags.ack != 0 }
+    var hasFIN: Bool { flags & VPhoneTCPFlags.fin != 0 }
+    var hasRST: Bool { flags & VPhoneTCPFlags.rst != 0 }
+
+    /// Sequence space this segment occupies. A SYN or FIN each cost one, which
+    /// matters when acknowledging them.
+    var sequenceLength: UInt32 {
+        UInt32(payload.count) + (hasSYN ? 1 : 0) + (hasFIN ? 1 : 0)
+    }
+
+    func bytes(source: VPhoneIPv4Address, destination: VPhoneIPv4Address) -> [UInt8] {
+        var header: [UInt8] = [
+            UInt8(sourcePort >> 8), UInt8(truncatingIfNeeded: sourcePort),
+            UInt8(destinationPort >> 8), UInt8(truncatingIfNeeded: destinationPort),
+            UInt8(truncatingIfNeeded: sequenceNumber >> 24), UInt8(truncatingIfNeeded: sequenceNumber >> 16),
+            UInt8(truncatingIfNeeded: sequenceNumber >> 8), UInt8(truncatingIfNeeded: sequenceNumber),
+            UInt8(truncatingIfNeeded: acknowledgmentNumber >> 24), UInt8(truncatingIfNeeded: acknowledgmentNumber >> 16),
+            UInt8(truncatingIfNeeded: acknowledgmentNumber >> 8), UInt8(truncatingIfNeeded: acknowledgmentNumber),
+            5 << 4, // data offset: five 32-bit words, no options
+            flags,
+            UInt8(windowSize >> 8), UInt8(truncatingIfNeeded: windowSize),
+            0, 0, // checksum
+            0, 0, // urgent pointer
+        ]
+        let whole = header + payload
+        let sum = VPhoneInternetChecksum.compute(
+            whole,
+            seed: VPhoneInternetChecksum.pseudoHeader(source: source, destination: destination, proto: 6, length: whole.count),
+        )
+        // A computed zero is transmitted as all ones (RFC 793).
+        let checksum = sum == 0 ? 0xFFFF : sum
+        header[16] = UInt8(checksum >> 8)
+        header[17] = UInt8(checksum & 0xFF)
+        return header + payload
+    }
+
+    init?(bytes: [UInt8]) {
+        guard bytes.count >= 20 else { return nil }
+        sourcePort = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
+        destinationPort = UInt16(bytes[2]) << 8 | UInt16(bytes[3])
+        sequenceNumber = UInt32(bytes[4]) << 24 | UInt32(bytes[5]) << 16 | UInt32(bytes[6]) << 8 | UInt32(bytes[7])
+        acknowledgmentNumber = UInt32(bytes[8]) << 24 | UInt32(bytes[9]) << 16 | UInt32(bytes[10]) << 8 | UInt32(bytes[11])
+        let headerLength = Int(bytes[12] >> 4) * 4
+        guard headerLength >= 20, bytes.count >= headerLength else { return nil }
+        flags = bytes[13]
+        windowSize = UInt16(bytes[14]) << 8 | UInt16(bytes[15])
+        payload = Array(bytes[headerLength...])
     }
 }

@@ -328,6 +328,101 @@ struct VPhoneUserspaceNetworkTests {
             Issue.record("DHCP should not be forwarded")
         }
     }
+
+    // MARK: - TCP
+
+    private func tcpFrame(_ segment: VPhoneTCPSegment, source: VPhoneIPv4Address, destination: VPhoneIPv4Address) -> [UInt8] {
+        let packet = VPhoneIPv4Packet(
+            source: source, destination: destination, proto: .tcp,
+            payload: segment.bytes(source: source, destination: destination),
+        )
+        return VPhoneEthernetFrame(destination: .gateway, source: guestMAC, etherType: .ipv4, payload: packet.bytes).bytes
+    }
+
+    /// TCP is terminated, not relayed, so the whole segment goes to the
+    /// forwarder along with the flow it belongs to.
+    @Test func `TCP segment becomes a forwardTCP`() throws {
+        let responder = responder()
+        let syn = VPhoneTCPSegment(
+            sourcePort: 51000, destinationPort: 80, sequenceNumber: 1000,
+            acknowledgmentNumber: 0, flags: VPhoneTCPFlags.syn, windowSize: 65535,
+        )
+        let frame = tcpFrame(syn, source: configuration.guestAddress, destination: VPhoneIPv4Address(1, 1, 1, 1))
+
+        guard case let .forwardTCP(flow, segment) = responder.handle(frame) else {
+            Issue.record("expected a TCP forward")
+            return
+        }
+        #expect(flow.sourcePort == 51000)
+        #expect(flow.destinationPort == 80)
+        #expect(flow.destinationAddress == VPhoneIPv4Address(1, 1, 1, 1))
+        #expect(flow.guestHardware.bytes == guestMAC.bytes)
+        #expect(segment.hasSYN)
+        #expect(segment.sequenceNumber == 1000)
+    }
+
+    // MARK: - TCP segment codec
+
+    @Test func `TCP segment round trips`() throws {
+        let segment = VPhoneTCPSegment(
+            sourcePort: 40000, destinationPort: 443, sequenceNumber: 0xDEAD_BEEF,
+            acknowledgmentNumber: 0x1234_5678, flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.psh,
+            windowSize: 65535, payload: [1, 2, 3, 4],
+        )
+        let parsed = try #require(VPhoneTCPSegment(bytes: segment.bytes(source: configuration.guestAddress, destination: .broadcast)))
+        #expect(parsed.sourcePort == 40000)
+        #expect(parsed.destinationPort == 443)
+        #expect(parsed.sequenceNumber == 0xDEAD_BEEF)
+        #expect(parsed.acknowledgmentNumber == 0x1234_5678)
+        #expect(parsed.hasACK && parsed.hasFIN == false)
+        #expect(parsed.windowSize == 65535)
+        #expect(parsed.payload == [1, 2, 3, 4])
+    }
+
+    /// The checksum covers the IP pseudo-header, so it only verifies when summed
+    /// against the same addresses it was built with.
+    @Test func `TCP checksum verifies over the pseudo-header`() {
+        let segment = VPhoneTCPSegment(
+            sourcePort: 1, destinationPort: 2, sequenceNumber: 3, acknowledgmentNumber: 4,
+            flags: VPhoneTCPFlags.ack, windowSize: 100, payload: [9, 9, 9],
+        )
+        let bytes = segment.bytes(source: configuration.guestAddress, destination: .broadcast)
+        let seed = VPhoneInternetChecksum.pseudoHeader(
+            source: configuration.guestAddress, destination: .broadcast, proto: 6, length: bytes.count,
+        )
+        #expect(VPhoneInternetChecksum.compute(bytes, seed: seed) == 0)
+    }
+
+    /// A SYN and a FIN each occupy one sequence number, which is what makes the
+    /// guest's acknowledgment of our SYN-ACK line up.
+    @Test func `SYN and FIN each cost one sequence number`() {
+        let syn = VPhoneTCPSegment(sourcePort: 1, destinationPort: 2, sequenceNumber: 0, acknowledgmentNumber: 0, flags: VPhoneTCPFlags.syn, windowSize: 0)
+        #expect(syn.sequenceLength == 1)
+        let synWithData = VPhoneTCPSegment(sourcePort: 1, destinationPort: 2, sequenceNumber: 0, acknowledgmentNumber: 0, flags: VPhoneTCPFlags.syn, windowSize: 0, payload: [1, 2])
+        #expect(synWithData.sequenceLength == 3)
+        let plain = VPhoneTCPSegment(sourcePort: 1, destinationPort: 2, sequenceNumber: 0, acknowledgmentNumber: 0, flags: VPhoneTCPFlags.ack, windowSize: 0)
+        #expect(plain.sequenceLength == 0)
+    }
+
+    /// A header with options still parses; the options are skipped rather than
+    /// misread as payload.
+    @Test func `TCP header with options is parsed past`() throws {
+        var bytes: [UInt8] = [
+            0x00, 0x50, 0x01, 0xBB, // 80 -> 443
+            0, 0, 0, 1, 0, 0, 0, 1,
+            8 << 4, // data offset 8 words = 32 bytes, so 12 bytes of options
+            VPhoneTCPFlags.ack, 0xFF, 0xFF, 0, 0, 0, 0,
+        ]
+        bytes += [UInt8](repeating: 0, count: 12) // the options themselves
+        bytes += [0xAA, 0xBB] // payload
+        let segment = try #require(VPhoneTCPSegment(bytes: bytes))
+        #expect(segment.sourcePort == 80 && segment.destinationPort == 443)
+        #expect(segment.payload == [0xAA, 0xBB])
+    }
+
+    @Test func `a truncated TCP segment is rejected`() {
+        #expect(VPhoneTCPSegment(bytes: [UInt8](repeating: 0, count: 19)) == nil)
+    }
 }
 
 // MARK: - Test shims

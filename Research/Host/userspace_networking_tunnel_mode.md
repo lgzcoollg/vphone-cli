@@ -121,16 +121,57 @@ host order while `sin_port` was converted, which asks for an entirely different
 address and fails with `EADDRNOTAVAIL`. Nothing in a VM would have said so
 clearly.
 
-## What is not done yet
+## Stage 3: TCP
 
-Stage 3 (TCP) is the real egress and the point of the mode; until then the guest
-can resolve names but not fetch anything.
+The guest's TCP is **terminated**, not relayed. That is the difference from UDP:
+a datagram can be forwarded as bytes, a stream cannot, because the guest's TCP
+expects a peer that speaks TCP. So this side answers the handshake, keeps its own
+sequence space, and carries the payload over an ordinary host socket whose other
+end is the host kernel's TCP.
 
-| | stage |
+| file | role |
 | --- | --- |
-| ARP, DHCP, ICMP to gateway | 1 (done) |
-| UDP + DNS | 2 (done) |
-| TCP (the real egress) | 3 |
+| `Network/VPhoneTCPForwarder.swift` | connection table, state machine, host socket per flow |
+| `Network/VPhoneInternetProtocol.swift` | `VPhoneTCPSegment` codec (header + flags + checksum) |
 
-That is expected, not a misconfiguration: the mode is not usable for real traffic
-until stage 3, which is also where the VPN payoff appears.
+The flow is: guest SYN → non-blocking `connect()` to the host → on writability,
+SYN-ACK back → guest ACK → both directions pump. Data the guest sends before the
+host has connected is buffered and flushed on the handshake's completion, so the
+guest never sees an unexplained stall.
+
+Three deliberate simplifications, each defensible because the guest-facing link
+is a local socketpair that neither reorders nor drops:
+
+- **No options are sent** — no SACK, no timestamps, no window scaling, so the
+  advertised window is capped at 65535. A guest that offers them is ignored,
+  which is the correct response from a peer that never did.
+- **We do not retransmit.** If a segment to the guest is lost anyway the guest
+  retransmits, and the duplicate is handled by the sequence check.
+- **No congestion control.** The path is host memory.
+
+The two sequence spaces are kept strictly apart, and that is the whole reason
+this stage is bigger than the last one. It is also the reason the alternative was
+rejected: doing this in the kernel is what would need a utun, and therefore
+privilege.
+
+### Verified
+
+20 checks, all passing: the segment codec (round trip, pseudo-header checksum
+verified by summing to zero, SYN/FIN each costing a sequence number, options
+parsed past rather than misread as payload, truncation rejected), the responder
+routing a SYN to `forwardTCP` with both ends and the guest's MAC, and — the one
+that matters — a **real handshake against a local TCP echo server**: SYN out,
+SYN-ACK back acknowledging it, guest ACK, payload, echo returned with the right
+acknowledgment, one connection tracked, and `stop()` clearing it.
+
+## Where this leaves the mode
+
+`tunnel` now has the full path: address, gateway, name resolution, and a real
+egress for both transports. It is the first time the mode could actually carry
+traffic.
+
+What has **not** happened yet is a run inside a real guest. Everything above is
+frame-level and socket-level against the host, which is what makes it cheap to
+run and what caught the two bugs so far (`sin_addr` byte order here, `sin_addr`
+again in UDP, and a double-advanced sequence number on SYN-ACK). A guest
+exercising Safari is a different kind of test and has not been done.
