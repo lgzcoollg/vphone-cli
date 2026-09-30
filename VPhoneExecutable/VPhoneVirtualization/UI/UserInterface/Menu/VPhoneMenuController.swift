@@ -34,6 +34,9 @@ class VPhoneMenuController {
     var settingsGetItem: NSMenuItem?
     var settingsSetItem: NSMenuItem?
     var restartGuestItem: NSMenuItem?
+    var setUDIDItem: NSMenuItem?
+    var resetUDIDItem: NSMenuItem?
+    var skipSetupAssistantItem: NSMenuItem?
     var panelMenuItems: [VPhoneGuestPanel: NSMenuItem] = [:]
     var rotateMenuItems: [NSMenuItem] = []
     var touchIDMonitor: VPhoneTouchIDMonitor? {

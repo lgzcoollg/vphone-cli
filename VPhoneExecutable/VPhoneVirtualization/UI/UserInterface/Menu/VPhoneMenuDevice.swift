@@ -4,7 +4,8 @@ import VPhoneCoreKit
 
 // MARK: - Device Menu
 
-/// The phone's buttons and input, and restarting it. Sensor overrides live
+/// The phone's buttons and input, the UDID it gives provisioning profile
+/// checks, and restarting it. Sensor overrides live
 /// in the Features menu.
 extension VPhoneMenuController {
     func buildDeviceMenu() -> NSMenuItem {
@@ -82,6 +83,9 @@ extension VPhoneMenuController {
         touchIDMenuItem = tidItem
         menu.addItem(tidItem)
         menu.addItem(NSMenuItem.separator())
+        addUDIDItems(to: menu)
+        menu.addItem(NSMenuItem.separator())
+        addSetupAssistantItem(to: menu)
         let restart = makeItem("Restart Guest…", action: #selector(restartGuest), symbol: "arrow.clockwise")
         restart.isEnabled = false
         restartGuestItem = restart

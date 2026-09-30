@@ -17,6 +17,22 @@ public enum FirmwareGuestSystemPatchSet {
 
     private static let ios27 = VPhonePatchApplicability(iOSBase: .major(27))
 
+    /// The bases where short-circuiting `checkTrustAndAuthorization` in the
+    /// shared cache is survivable.
+    ///
+    /// Not a preference — a preference belongs in a preset's block list, and
+    /// `standard` blocks this one too. This is the harder statement: on iOS 27 the
+    /// patch stops the guest booting. TXM rejects the re-attested page, dyld
+    /// cannot map `libSystem.B.dylib`, and `initproc failed to start`
+    /// (issue #532). Without the gate, `experimental` — which is `Kind = All` —
+    /// would hand a 27 user an unbootable VM.
+    ///
+    /// An unreadable base satisfies only `.any`, so an unknown release skips the
+    /// patch. That is the safe direction here.
+    private static let misTrustAuthBases = VPhonePatchApplicability(
+        iOSBase: .oneOf([.major(18), .major(26)]),
+    )
+
     public static let manifest = VPhonePatchSetManifest(
         identifier: identifier,
         name: "Guest System",
@@ -60,15 +76,19 @@ public enum FirmwareGuestSystemPatchSet {
                 bootEssential: true,
             ),
             VPhonePatchDeclaration(
-                identifier: "dyld-cfw-mis_trust_auth",
+                identifier: "dyld-exp-mis_trust_auth",
                 title: "MIS online authorization",
                 summary: """
-                Accepts a provisioning profile that wants online authorization. The guest is \
-                hacktivated and has no activation record, so it can never obtain the device \
-                identity such a profile is checked against; without this, an app signed with a \
-                free personal-team certificate installs but refuses to launch.
+                Accepts a provisioning profile that wants online authorization, by short-circuiting \
+                the check in the shared cache. Off by default: libmisfix.dylib already declines the \
+                same check from userspace in installd and misagent, and editing the cache for it \
+                stops an iOS 27 guest booting. Turn it on only on a 26.x base, and only to launch \
+                an app signed with a free personal-team certificate — that launch goes through \
+                SpringBoard, which the hook does not cover. Not offered on iOS 27, where it stops \
+                the guest booting.
                 """,
                 target: .dyldSharedCache,
+                applicability: misTrustAuthBases,
             ),
 
             // MARK: System Daemons
@@ -110,28 +130,33 @@ public enum FirmwareGuestSystemPatchSet {
             ),
             VPhonePatchDeclaration(
                 identifier: "system-installd-cfw-adhoc_signature",
-                title: "installd ad-hoc signatures",
+                title: "installd signature policy",
                 summary: """
                 Lets Xcode install an app the guest would otherwise refuse. installd asks \
                 MobileIdentityService to validate a bundle without allowing an ad-hoc \
-                signature, so anything not signed with an Apple leaf fails at \
-                0xE8008014 even though the guest runs unsigned code perfectly well. A \
-                hook in /usr/lib/libmisfix.dylib, loaded into installd, sets the option \
-                MIS already understands. Nothing in the dyld shared cache is touched.
+                signature and insists on a provisioning profile no VM can satisfy, so an \
+                install fails at 0xE8008014 or 0xE8008015 even though the guest runs \
+                unsigned code perfectly well. A hook in /usr/lib/libmisfix.dylib, loaded \
+                into installd, sets the options MIS already understands, answers \
+                ProvisionsAllDevices for every profile, and turns on the ad-hoc switch \
+                MICodeSigningVerifier carries and installd never sets. Nothing in the dyld \
+                shared cache is written on disk: the libmis functions are detoured in \
+                installd's own copy-on-write pages.
                 """,
                 target: .guestExecutable(path: "/usr/libexec/installd"),
             ),
             VPhonePatchDeclaration(
                 identifier: "system-misagent-cfw-device_identity",
-                title: "misagent device identity",
+                title: "misagent profile scope",
                 summary: """
-                Lets a provisioning profile written for a device you already own install on \
-                this guest. misagent compares the profile's ProvisionedDevices against the \
-                UDID MobileGestalt reports, and a VM's UDID is in nobody's list, so a paid \
-                team's profile fails at 0xE8008012. The same hook, loaded into misagent, \
-                answers that one query with the UDID set in /usr/lib/libmisfix.plist. Off \
-                until a UDID is set there, and it does not change what Xcode or lockdown \
-                report.
+                Lets any provisioning profile install on this guest. misagent asks the \
+                profile whether it provisions all devices and otherwise compares its \
+                ProvisionedDevices against the UDID MobileGestalt reports; a VM's UDID is \
+                in nobody's list, so a paid team's profile fails at 0xE8008012. The same \
+                hook, loaded into misagent, answers the first question yes, so the profile \
+                installs for real and the app is validated against it. It can also answer \
+                the UDID query with a device set in /usr/lib/libmisfix.plist, which is off \
+                until one is set and does not change what Xcode or lockdown report.
                 """,
                 target: .guestExecutable(path: "/usr/libexec/misagent"),
             ),

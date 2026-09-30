@@ -76,6 +76,16 @@ extension GuestAPI {
         if names.contains("libvcamcaptured.dylib") || names.contains("SystemHook-vphone.dylib") {
             restarted = stopProcesses(named: "cameracaptured")
         }
+        // Same for the MIS hook: a running daemon keeps the copy it mapped at
+        // launch, so replacing the file changes nothing until it restarts.
+        // SystemHook is what inserts libmisfix into these, so a new SystemHook
+        // matters to them too. SpringBoard is deliberately not in this list —
+        // restarting it is a respring, which is `system.respring` to ask for
+        // and not something an environment update should do behind the back of
+        // whoever is looking at the screen.
+        if names.contains("libmisfix.dylib") || names.contains("SystemHook-vphone.dylib") {
+            restarted += GuestAPI.udidHookedDaemons.flatMap { stopProcesses(named: $0) }
+        }
         return [
             "installed": names,
             "restarted_pids": restarted,
@@ -159,7 +169,9 @@ extension GuestAPI {
         }
     }
 
-    private static func stopProcesses(named name: String) -> [Int] {
+    /// Sends SIGTERM to every process with this name; launchd starts an
+    /// on-demand daemon again for its next client.
+    static func stopProcesses(named name: String) -> [Int] {
         let rows = (try? listProcesses(filter: name))?["processes"] as? [[String: Any]] ?? []
         return rows.compactMap { row in
             guard row["name"] as? String == name, let pid = row["pid"] as? Int, kill(pid_t(pid), SIGTERM) == 0

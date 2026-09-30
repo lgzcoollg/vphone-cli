@@ -43,11 +43,48 @@
 // profiles install here, with no portal round trip and nothing to redo after a
 // rebuild.
 //
+// ## How far this reaches, measured
+//
+// misagent, and nothing else. Its main executable calls `MGCopyAnswer` itself,
+// so the interpose catches it and a profile naming the configured device
+// installs.
+//
+// installd does not benefit and no interpose can make it. Its profile check
+// runs MobileInstallation → libmis → libMobileGestalt, all three inside the
+// dyld shared cache, and an interpose rewrites call sites in the images dyld
+// links — not the cache's own. Measured on test-26.4 (2026-09-30,
+// `libmisfix[726]`): one `devicectl device install app`, `LogQueries` on, and
+// the only line from installd is `MGCopyAnswer(BuildVersion) from installd`.
+// No `UniqueDeviceID` query, although libmis plainly resolved one — it skipped
+// every installed profile with `0xE8008012` and then returned
+//
+//     +[MICodeSigningVerifier _validateSignatureAndCopyInfoForURL:withOptions:error:]:
+//         80: Failed to verify code signature of …/AirBuild.app : 0xe8008015
+//
+// The signature itself was fine; the same capture has `cdhash: <private> is
+// trusted`. libmis's other route to a UDID is closed too:
+// `amfi_interface_query_bootarg_state returned error Function not implemented`.
+//
+// ## Why this is now a convenience rather than the fix
+//
+// Making a profile install was one way to get an Xcode install through. It is
+// no longer the way this project takes: MISFixSignature.c validates the bundle
+// on its own signature with `ValidatedByProfile = 0`, and
+// MISFixProfilePolicy.c lets the embedded profile fail to install without
+// failing the install. An arbitrary IPA then goes in with no UDID configured
+// at all, which is the point — pinning a VM to a borrowed UDID only ever
+// worked for a team whose registered devices you already have.
+//
+// The override is kept because it is harmless, already shipped, and reachable
+// from the VM window's Device ▸ Set UDID…. Setting it makes profiles install
+// for real instead of being skipped, which is closer to what the device would
+// have done.
+//
 // ## The inconsistency this creates, stated plainly
 //
-// The guest now gives two different answers about which device it is. What
-// Xcode, `devicectl` and lockdown report is unchanged — that UDID is built by
-// TXM before the kernel runs, out of the device tree's `chip-id` and
+// The guest gives two different answers about which device it is. What Xcode,
+// `devicectl` and lockdown report is unchanged — that UDID is built by TXM
+// before the kernel runs, out of the device tree's `chip-id` and
 // `unique-chip-id`, and nothing in userspace can alter it. Only the processes
 // carrying this hook see the configured value.
 //
@@ -60,8 +97,53 @@
 #include "MISFixConfig.h"
 #include "MISFixInterpose.h"
 
+#include <mach-o/dyld.h>
+
 extern CFTypeRef MGCopyAnswer(CFStringRef property);
 extern CFTypeRef MGCopyAnswerWithError(CFStringRef property, uint32_t *error);
+
+/// Log every MobileGestalt query this hook sees, and whether it answered.
+///
+/// Off unless the config sets `LogQueries`, because these daemons are asked a
+/// lot and the log is how a person watches an install. It exists because the
+/// interesting failure is *silence*: the override reaches misagent and a
+/// profile installs, but installd then refuses the same app with
+/// `0xE8008015`, and the two explanations — installd asking and getting the
+/// wrong answer, versus installd never asking through this symbol at all —
+/// look identical from outside.
+///
+/// It has now told us which. Each line names the caller's image, and installd
+/// produced exactly one, `MGCopyAnswer(BuildVersion) from installd`: the main
+/// executable's own call and nothing else. The header's "How far this reaches"
+/// has the rest. The instrument stays because the answer is a property of this
+/// cache and this dyld, not a law, and one capture re-checks it.
+static void vpLogQuery(CFStringRef property, int answered, const char *caller) {
+    char name[128];
+    if (property == NULL
+        || !CFStringGetCString(property, name, sizeof(name), kCFStringEncodingUTF8))
+    {
+        return;
+    }
+    MISFixLog(
+        "MGCopyAnswer(%s) from %s %s",
+        name,
+        caller,
+        answered ? "-> override" : "passed through"
+    );
+}
+
+/// Say, once, that this dylib is in this process.
+///
+/// The positive control the diagnosis needs. Without it, "installd logged no
+/// MGCopyAnswer" has two readings that look the same — the call never came
+/// through the interposed symbol, or the hook was not in the process at all —
+/// and they call for opposite fixes. With it, the pair of lines is decisive:
+/// this one and no query line means the call is bypassing the interpose.
+__attribute__((constructor)) static void vpAnnounce(void) {
+    char path[4096];
+    uint32_t size = sizeof(path);
+    MISFixLog("loaded into %s", _NSGetExecutablePath(path, &size) == 0 ? path : "<unknown>");
+}
 
 /// MobileGestalt's key for the UDID. A plain string, not the SDK constant:
 /// there is no public header, and this is the literal misagent carries.
@@ -84,12 +166,16 @@ static CFTypeRef vpOverrideFor(CFStringRef property) {
 }
 
 static CFTypeRef vpMGCopyAnswer(CFStringRef property) {
+    const char *caller = MISFixCaller();
     CFTypeRef override = vpOverrideFor(property);
+    vpLogQuery(property, override != NULL, caller);
     return override != NULL ? override : MGCopyAnswer(property);
 }
 
 static CFTypeRef vpMGCopyAnswerWithError(CFStringRef property, uint32_t *error) {
+    const char *caller = MISFixCaller();
     CFTypeRef override = vpOverrideFor(property);
+    vpLogQuery(property, override != NULL, caller);
     if (override == NULL)
         return MGCopyAnswerWithError(property, error);
     if (error != NULL)

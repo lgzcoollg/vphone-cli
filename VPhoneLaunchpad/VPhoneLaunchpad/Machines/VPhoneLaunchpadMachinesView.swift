@@ -33,6 +33,11 @@ struct VPhoneLaunchpadMachinesView: View {
     @State private var filter = ""
     /// Empty keeps the order `vm list` returns; a header click replaces it.
     @State private var sortOrder: [KeyPathComparator<VPhoneLaunchpadMachine>] = []
+    /// The table appears only once `vm list` returns, after the window has
+    /// picked its first responder, so nothing focuses it by itself. Unfocused,
+    /// AppKit draws the library's automatic selection in gray, not in the
+    /// accent color.
+    @FocusState private var tableIsFocused: Bool
 
     private var library: VPhoneLaunchpadMachineLibrary {
         model.machines
@@ -74,11 +79,6 @@ struct VPhoneLaunchpadMachinesView: View {
                     )
                 } else if library.selection.count > 1 {
                     ContentUnavailableView("\(library.selection.count) Machines Selected", systemImage: "iphone")
-                } else if model.bundles.progress != nil {
-                    Form {
-                        VPhoneLaunchpadInstallSection()
-                    }
-                    .formStyle(.grouped)
                 } else {
                     ContentUnavailableView("No Selection", systemImage: "iphone")
                 }
@@ -289,6 +289,18 @@ struct VPhoneLaunchpadMachinesView: View {
                 .disabled(!isStopped)
             Button("Export…") { sheet = .export([machine.path]) }
                 .disabled(!isStopped)
+            Button("Install Custom Firmware") {
+                Task { await library.installCustomFirmware(machine.path) }
+            }
+            // Only for an unfinished install: that is when the restore tree it
+            // reads is still there. A finished one removes it.
+            .disabled(!isStopped || machine.customFirmwareInstalled != false)
+            // The finished-install counterpart: redeploys the active bundle's
+            // guest resources without the restore tree.
+            Button("Update Guest Environment") {
+                Task { await library.updateGuestEnvironment(machine.path) }
+            }
+            .disabled(!isStopped || machine.restoreInfo == nil || machine.customFirmwareInstalled == false)
             Divider()
             Button("Show in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([machine.path.url])
@@ -351,6 +363,14 @@ struct VPhoneLaunchpadMachinesView: View {
             machineActions(library.machines.filter { paths.contains($0.path) })
         } primaryAction: { paths in
             start(library.machines.filter { paths.contains($0.path) && library.state(of: $0.path) == .stopped })
+        }
+        .focused($tableIsFocused)
+        .onAppear {
+            // The table comes back when a search matches again; the search
+            // field keeps the keyboard then.
+            if !(NSApp.keyWindow?.firstResponder is NSText) {
+                tableIsFocused = true
+            }
         }
     }
 

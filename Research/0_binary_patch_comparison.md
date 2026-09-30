@@ -89,10 +89,10 @@
 >
 > **Version gates replaced three flags.** The patches `--frida`,
 > `--force-exc-guard` and `--force-dsc-maxslide` controlled now carry a structured
-> `VPhonePatchApplicability`: `kernel.thread_guard_violation` is pinned to
+> `VPhonePatchApplicability`: `kernel-boot-thread_guard_violation` is pinned to
 > `iOSBase: .major(18)` (whose runningboardd trips a flavor-10 Mach port guard and
-> crash-loops the UI), `dsc_maxslide.zero` to `.major(27)`, and the two
-> `kernelcache_frida.*` patches to `cloudOS: .atLeast(26, 4)`. A preset can turn a
+> crash-loops the UI), `dyld-boot-maxslide` to `.major(27)`, and the two
+> `kernel-exp-frida_*` patches to `cloudOS: .atLeast(26, 4)`. A preset can turn a
 > patch off, and a VM can turn one on that its preset leaves off, but neither can
 > widen a version gate — so forcing the guard or the slide onto a 26.x base is no
 > longer possible. That capability was opt-in for third-party RASP SDKs and was
@@ -391,7 +391,7 @@
 | 15    | `mov w0,#0`                | `_handle_fsioc_graft`            | Allow fsioc graft                                  |    Y    |  Y  |  Y  |
 | 16    | NOP (3x)                   | `handle_get_dev_by_role`         | Bypass APFS role-lookup deny gates for boot mounts |    Y    |  Y  |  Y  |
 | 17-26 | `mov x0,#0; ret` (5 hooks) | Sandbox MACF ops table           | Stub 5 sandbox hooks                               |    Y    |  Y  |  Y  |
-| 27    | `PACIBSP→RET`              | `_thread_guard_violation`        | Disable fatal EXC_GUARD (Mach port guard) delivery. Dev variant + iOS 18 bases always. The old `--force-exc-guard` opt-in for other bases is gone; `kernel.thread_guard_violation` is pinned to `iOSBase: .major(18)` (see note below). | Y* | Y | Y* |
+| 27    | `PACIBSP→RET`              | `_thread_guard_violation`        | Disable fatal EXC_GUARD (Mach port guard) delivery. Dev variant + iOS 18 bases always. The old `--force-exc-guard` opt-in for other bases is gone; `kernel-boot-thread_guard_violation` is pinned to `iOSBase: .major(18)` (see note below). | Y* | Y | Y* |
 
 † Always required on iOS 18 bases (18.6.2's runningboardd/SpringBoard trip `GUARD_TYPE_MACH_PORT` "flavor 10", crash-looping the UI — the VM won't boot without it there). On other bases this is opt-in, not always-on: some third-party apps shipping crash-reporting/RASP SDKs (Bugly, Crashlytics, KSCrash, ...) call `task_swap_exception_ports()`, which the research kernel can enforce as a fatal `GUARD_TYPE_MACH_PORT`/`KOBJECT_REPLY_PORT_SEMANTICS` violation (see [upstream issue #291](https://github.com/Lakr233/vphone-cli/issues/291), reproduced and confirmed via crash logs against a `kernelcache.research.vphone600 (26.1/23B85)` build) — but it's not required for the VM itself to boot on 26.x, so it stays opt-in rather than always-on for regular/jb/exp. `applyExcGuard` in `FirmwarePipeline`/`KernelPatcher` is `iosBaseIs18 || forceExcGuard`; pass `--force-exc-guard` to `patch-firmware` (or `FORCE_EXC_GUARD=1` to the relevant `make fw_patch*` target) to enable it on a base that needs it. `iosBaseIs18` (from `iPhone-BuildManifest.plist`'s `ProductVersion`) also still gates the unrelated 18.x skywalk-netagent boot-arg workaround. **Superseded:** the `--force-exc-guard` / `FORCE_EXC_GUARD=1` opt-in and the `iosBaseIs18` boolean no longer exist. The patch is declared with `iOSBase: .major(18)`, and no preset or VM selection can widen that gate, so it cannot be applied on 26.x.
 
@@ -463,14 +463,14 @@ do NOT execute these).
 | 7   | cstring byte 5 mangle `'h' → 'X'` (`"kern.hv_vmm_present"` → `"kern.Xv_vmm_present"`) + per-page slot-hash re-attestation, BLACKLIST semantics — **EXP only** | DSC dylibs        | Companion to EXP kernel rename (`KernelEXPPatcher.patchHvVmmRename`). The mangle is applied to every DSC dylib EXCEPT those in `DONT_PATCH_INSTALL_NAMES` (sign-in / device-likeness consumers, ~15 entries). Patched dylibs query `kern.Xv_vmm_present` and get the truthful 1 (graphics / accel passthrough). Blacklisted dylibs keep the original cstring, hit ENOENT on the renamed kernel, cache 0, lie about VM presence. On `codeSigningMonitor == 2` hardware the byte-mangle alone causes `CODESIGNING/Invalid Page` SIGKILL because TXM enforces per-page hashes; the re-attestation pass recomputes the SHA-256 slot in the chunk's `CS_CodeDirectory` for every modified 16 KiB page. See `scripts/patchers/cfw_dsc_codesign.py` and `cfw_patch_hv_vmm_dsc.py`. |    -    |  -  |  -  |
 | 8   | (removed — was: standalone-binary mangle in 6 rootfs Mach-Os via SSH) | n/a               | Removed in the blacklist-flip redesign. With the EXP kernel rename in place, the 6 rootfs binaries (MobileActivationMigrator, CheckerBoard, StoreKitUISceneService, storekitd, appstored, CorePrescriptionService) get the desired "cache 0 / not in a VM" behavior for free: they keep their original cstring, hit ENOENT on the renamed kernel sysctl, defensive `cbnz w0, skip` leaves the cached byte at BSS-zero. No SSH-time standalone patch needed. |    -    |  -  |  -  |
 | 9   | `mov w3,#<size>` -> `mov w3,#<base-size>` in `_kern_SwapEnd` — **26.0/26.0.1 and 18.x** | DSC `IOMobileFramebuffer` | Fixes host VZ GUI black-screen with the available PCC vphone600 userclient: the userclient does an exact `checkStructureInputSize` check on external-method-5 (SwapEnd) input, so a userland whose `_kern_SwapEnd` sends a different-sized state gets `kIOReturnBadArgument` and the host display stays black (guest still renders — the Apple logo is visible over VNC, just not in the vphone-cli view). **The accepted size is a property of the base kernel, not the userland**: 26.1 base -> **0x560**, 26.4 base (xnu-12377) -> **0x588**. The 0x588 value is confirmed two ways: the sole dispatch-shaped entry in `kernelcache.*.vphone600` with `checkStructureInputSize==0x588` (scalarIn=0, scalarOut=0, structOut=0, preceded by a ptrauth code ptr, at decompressed file offset 0x9c7228), and empirically — native 26.5 userland sends 0x588 and displays correctly on this stack. Source (userland-sent) sizes observed: 18.6.2 = 0x514, 26.0/26.0.1 = 0x548, 27.0 (24A5380h) = 0x6e0. The patcher is semantic (anchors on `mov w1,#5` -> `mov w3,#imm` -> `mov x4,#0`/`mov x5,#0` -> `bl` inside `_kern_SwapEnd`) and idempotent — rewrites the size to `--target-size` regardless of source and re-attests the modified DSC page. Install gate: `26.0*` / `18.*` -> 0x560 (26.1 base). Validated after host install on `17,3_26.0_23A341`, `17,3_26.0.1_23A355`, and `17,3_18.6.2_22G100` (Apple logo renders) against the 26.1 base. **CORRECTION (2026-07-15): iOS 27.0 is NO LONGER handled here.** 27 presents the paravirt display via IOMFB's `_virt_*` callback path — external method 5 is NEVER called — so no SwapEnd *size* change can help 27 (confirmed by kernel trace + live AppleParavirtGPU idle scheduler). iOS 27 now uses **force-kern (item 11)** to route present back onto method 5; this row applies to 26.0/26.0.1/18.x only. |    Y    |  Y  |  Y  |
-| 10  | Zero `maxSlide` in `dyld_cache_header` (`@0xF0`) — **iOS 27.0 / any userland whose cache overflows the 6 GiB region** | DSC `dyld_shared_cache_arm64e` header | Fixes pid-1 `launchd` panic at boot on the vphone600 26.x kernel. The kernel reserves `SHARED_REGION_SIZE_ARM64 = 0x180000000` (6 GiB) and, at map time, needs room for the cache's mapped span **plus** the header `maxSlide` (ASLR range). iOS 27.0's cache (span `0x17c830000` ≈ 5.95 GiB) + `maxSlide 0x20000000` = `0x19c830000` > 6 GiB, so `_shared_region_map_and_slide` returns `ENOMEM`, dyld cannot map `libSystem.B.dylib`, and `launchd` panics (`initproc failed to start`). Zeroing `maxSlide` (LE u64) in the main chunk maps the cache at slide 0 (fits with ~58 MiB spare). Install gate: **`27.*`** (hard-gated in `cfw_install.sh` as of 2026-07-20 — an 18.x/26.x base skips it entirely). The patcher additionally self-gates (`patch-dsc-maxslide`): no-op unless span + maxSlide > `0x180000000`, kept as defense-in-depth so 26.x / 18.x are untouched even if the install gate were removed. **The non-27 opt-in is gone** (2026-09-30): `FORCE_DSC_MAXSLIDE=1`, later `--force-dsc-maxslide`, no longer exists on any command or in Launchpad. `dsc_maxslide.zero` is declared `iOSBase: .major(27)`, so non-27 bases keep their native slide. `patch-dsc-maxslide --force` remains on the standalone verb for hand use; `cfw install` never passes it. **24A435 (27.0 RC) checked 2026-09-30** for issue #531: the pristine SystemOS cryptex header reads `sharedRegionStart 0x180000000`, `sharedRegionSize 0x17D504000`, `maxSlide 0x20000000`, so span + slide is `0x19D504000`. `vphone-cli cfw patch-dsc-maxslide --dry-run` (2.1.6) reports `overflow` and would zero it; an installed 24A435 guest reads `maxSlide 0x0` and boots. The self-gate therefore patches 24A435 without force. The 512 MiB slide is the cache builder's fixed iOS arm64 value, so every 27 cache overflows this region. Source check (xnu-12377, `shared_region_map_and_slide_2_np`, `vm_shared_region_map_file_setup`, `vm_map_locate_space_fixed`): the kernel picks a 16 KiB-aligned slide strictly below `maxSlide` and maps each range FIXED inside the `0x180000000` submap. With no twig rounding and no reserved area, `size + maxSlide <= 0x180000000` is a sufficient test, one 16 KiB page stricter than needed. The #531 panic therefore came from a guest whose cache was never patched. Most likely its CFW install had not completed, because `cfw install` swaps in its clone only on success. It did not come from the gate. **No** page re-attestation (header metadata, not a `cs_validate`'d code page — confirmed empirically). Validated on `17,3_27.0_24A5380h` + cloudOS 26.4 (`c0ecdb4b…`): `dyld cache mapped system-wide`, launchd reaches first unlock, vphoned connects as iOS 27.0.0, 0 panics. See `scripts/patchers/cfw_patch_dsc_maxslide.py`. |    Y    |  Y  |  Y  |
+| 10  | Zero `maxSlide` in `dyld_cache_header` (`@0xF0`) — **iOS 27.0 / any userland whose cache overflows the 6 GiB region** | DSC `dyld_shared_cache_arm64e` header | Fixes pid-1 `launchd` panic at boot on the vphone600 26.x kernel. The kernel reserves `SHARED_REGION_SIZE_ARM64 = 0x180000000` (6 GiB) and, at map time, needs room for the cache's mapped span **plus** the header `maxSlide` (ASLR range). iOS 27.0's cache (span `0x17c830000` ≈ 5.95 GiB) + `maxSlide 0x20000000` = `0x19c830000` > 6 GiB, so `_shared_region_map_and_slide` returns `ENOMEM`, dyld cannot map `libSystem.B.dylib`, and `launchd` panics (`initproc failed to start`). Zeroing `maxSlide` (LE u64) in the main chunk maps the cache at slide 0 (fits with ~58 MiB spare). Install gate: **`27.*`** (hard-gated in `cfw_install.sh` as of 2026-07-20 — an 18.x/26.x base skips it entirely). The patcher additionally self-gates (`patch-dsc-maxslide`): no-op unless span + maxSlide > `0x180000000`, kept as defense-in-depth so 26.x / 18.x are untouched even if the install gate were removed. **The non-27 opt-in is gone** (2026-09-30): `FORCE_DSC_MAXSLIDE=1`, later `--force-dsc-maxslide`, no longer exists on any command or in Launchpad. `dyld-boot-maxslide` is declared `iOSBase: .major(27)`, so non-27 bases keep their native slide. `patch-dsc-maxslide --force` remains on the standalone verb for hand use; `cfw install` never passes it. **24A435 (27.0 RC) checked 2026-09-30** for issue #531: the pristine SystemOS cryptex header reads `sharedRegionStart 0x180000000`, `sharedRegionSize 0x17D504000`, `maxSlide 0x20000000`, so span + slide is `0x19D504000`. `vphone-cli cfw patch-dsc-maxslide --dry-run` (2.1.6) reports `overflow` and would zero it; an installed 24A435 guest reads `maxSlide 0x0` and boots. The self-gate therefore patches 24A435 without force. The 512 MiB slide is the cache builder's fixed iOS arm64 value, so every 27 cache overflows this region. Source check (xnu-12377, `shared_region_map_and_slide_2_np`, `vm_shared_region_map_file_setup`, `vm_map_locate_space_fixed`): the kernel picks a 16 KiB-aligned slide strictly below `maxSlide` and maps each range FIXED inside the `0x180000000` submap. With no twig rounding and no reserved area, `size + maxSlide <= 0x180000000` is a sufficient test, one 16 KiB page stricter than needed. The #531 panic therefore came from a guest whose cache was never patched. Most likely its CFW install had not completed, because `cfw install` swaps in its clone only on success. It did not come from the gate. **No** page re-attestation (header metadata, not a `cs_validate`'d code page — confirmed empirically). Validated on `17,3_27.0_24A5380h` + cloudOS 26.4 (`c0ecdb4b…`): `dyld cache mapped system-wide`, launchd reaches first unlock, vphoned connects as iOS 27.0.0, 0 panics. See `scripts/patchers/cfw_patch_dsc_maxslide.py`. |    Y    |  Y  |  Y  |
 | 11  | Retarget public `_IOMobileFramebufferSwap*` trampolines -> `b _kern_Swap*` (force-kern) — **iOS 27.0** | DSC `IOMobileFramebuffer` | **iOS-27 VZ-view (host paravirt-GPU scanout) fix, userland half.** The host `VZVirtualMachineView` is fed by the guest `AppleParavirtGPU` scanout, which the 26.4 kernel drives ONLY from the IOMFB userclient SwapEnd (external method 5) — the `_kern_Swap*` path. iOS 27 defaults the paravirt display's present to IOMFB's parallel `_virt_Swap*` path (`_virt_SwapEnd` does no userclient call — it invokes an in-process callback `blraaz [conn+0xe68]` and hands the IOSurface to a virtual-display consumer), so the paravirt GPU never scans out → host VZ window black (guest still composites; GUI visible over in-guest TrollVNC; AppleParavirtGPU `SchedulerState` idle). The public `_IOMobileFramebufferSwap*` entrypoints are thin trampolines (`cbz x0; ldr xN,[x0,#slot]; cbz xN; braaz xN`) that tail-call the per-connection swap fp (kern or virt impl). This patch rewrites each trampoline's first insn to `b _kern_Swap<Name>`, forcing present onto method 5 regardless of how 27 classified the display (tail-call, args intact → behaviourally identical to selecting the kern fp). Fully dynamic: public + `_kern_` addrs resolved by name via `ipsw dyld symaddr`, trampoline shape verified by Capstone, branch bytes from Keystone `asm_at()`, modified DSC code pages re-attested. Requires ≥{SwapBegin,SwapEnd,SwapSetLayer} or raises (dry-run retargets 31 entrypoints on 24A5380h, skips 4 non-trampolines). **Pairs with the JB kernel patches (`patchIomfbSwapEndVariableSize` + `patchIomfbSwapEndHandlerSize`)** which relax the 26.4 userclient's two exact `0x588` size gates to accept 27's native `0x6e0` IOMFBSwapRec (prefix matches 26.x, so the paravirt swap handler reads valid fields). Install gate: `27.*`. See `scripts/patchers/cfw_patch_iomfb_force_kern.py`. **VALIDATED on-device (2026-07-15, `17,3_27.0_24A5380h` + cloudOS 26.4 `c0ecdb4b…`, JB): iOS 27 userland renders AND is interactive in the native VZ view (not just TrollVNC); clean boot — no `kIOReturnBadArgument`/SwapEnd rejection/panic.** Runtime confirmed 31 entrypoints retargeted (4 non-trampoline setters left on virt). |    Y    |  Y  |  Y  |
 | 12  | NOP `-[_LSDModifyClient clientIsEntitledForEmbeddedRegistrationOperations]` entitlement gate + per-page re-attest — **iOS 27.0** | DSC `CoreServices` (LaunchServices) | **iOS-27 app-registration fix.** lsd gates `-[_LSDModifyClient performPostInstallationRegistration:operationUUID:reply:]` (and the containerized/rebuild registration paths) behind `clientIsEntitledForEmbeddedRegistrationOperations`, which does `xpc_connection_copy_entitlement_value` on the XPC peer for any of `com.apple.private.coreservices.lsaw` / `com.apple.private.installcoordinationd.daemon` / `com.apple.private.coreservices.can-register-install-results`. A client without one gets `NSOSStatusErrorDomain -54` (permErr, `LSDModifyService.mm:1639`), so `registerApplicationDictionary:` / `registerContainerizedApplicationWithInfoDictionaries:` fail and no app can (re)register — blocking vphoned's installer, TrollStore, and uicache/Sileo alike. The entitlement route is a dead end even for a launchd platform daemon (vphoned) whose validated csblob (`csops CS_OPS_ENTITLEMENTS_BLOB`) contains all three: LS registration is proxied, so the XPC peer lsd inspects is not the registering process. Fix: NOP the final `cbz w0, <not_entitled>` (the conditional branch whose fall-through sets the `mov w<reg>,#1` result) so the method always returns YES. Fully dynamic: method resolved via the DSC's own `.symbols` in-image local-symbol table (ipsw `symaddr -a`/`a2s` time out on this cache), gate located by control-flow shape in Capstone, NOP from Keystone `asm("nop")`, modified 16 KiB page re-attested (`cfw_dsc_codesign.py`; TXM enforces per-page). The resulting CDHash change is accepted by the JB always-true AMFI cdhash-trust patch. Install gate: **`27.*`** (hard-gated in `cfw_install.sh` as of 2026-07-20 — an 18.x/26.x base does not apply it). The patcher additionally self-gates (`patch-lsd-embedded-reg`): no-op on pre-iOS-27 userlands where the method is absent. **Pairs with vphoned's `vp_register_path` containerized-registration fallback** (`registerContainerizedApplicationWithInfoDictionaries:...:registrationError:`, treating a nil `registrationError` as success since it returns NO even when it registers). Also paired with **`/cores/vpregister`** (built + deployed by `cfw_install_jb.sh` / `cfw_install_exp.sh`, invoked by `vphone_jb_setup.sh` at first boot — 27-gated by DEPLOYMENT: `cfw_install_jb.sh`/`cfw_install_exp.sh` copy `/cores/vpregister` only when the mounted rootfs `SystemVersion.plist` is `27.*`, and the setup script's `[ -x /cores/vpregister ]` presence check is the runtime gate. Do NOT gate the invocation on a guest `sw_vers` check — the hybrid guest does not reliably report the 27 userland version at first boot, which silently skipped registration): it registers JB app bundles (Sileo) via the same containerized API, because `uicache -a`'s `registerApplicationDictionary:` is a deprecated no-op on iOS 27 (lsd logs *"you cannot use ... to register applications anymore. These interfaces have been deprecated for years."*). **VALIDATED (2026-07-17, `17,3_27.0_24A5380h` + cloudOS 26.4, JB): -54 gone; Sileo registers (`uicache -l` 0→1) via `vpregister`; vphoned installs+registers a test IPA (`com.vphone.vptest`) to `/var/containers/Bundle/Application/` end-to-end. Clean boot (re-attest correct; no CoreServices page rejection).** See `scripts/patchers/cfw_patch_lsd_embedded_reg.py` and `Siblings/VPRegister/vpregister.m`. **FIX (2026-08-10):** `_find_gate` only matched the live `cbz`/`cbnz` branch shape, so re-running `cfw install` (host-mount flow, `myphone` VM, `17,3_27.0_24A5390f`) against a cache where this gate was already NOP'd from a prior pass raised `ValueError: ... entitled-result gate ... not found` instead of recognizing the idempotent state (unlike the Cryptex/IOMFB steps, which log `already ... idempotent` and skip cleanly). Confirmed live via host-mount disassembly: the third check's `bl <check3>` is followed by a bare `nop` at the gate site (exact match against `asm("nop")` bytes) immediately before `mov w20, #1` — i.e. already patched. `_find_gate` now also matches `nop` immediately preceding `mov w<reg>,#1` as an already-patched gate, so a re-run just re-attests the page instead of erroring. |    Y    |  Y  |  Y  |
 | 13  | `mov x0,#1; ret` on `-[DIDiskArb isMountCompleteWithExpectedCount:diskTracker:]` — **iOS 27.0** | `diskimagesiod` | **iOS-27 DDI (`/System/Developer`) auto-mount — mount-gate.** After the personalized DDI attaches (kernel side: JB-28 + JB-09), MobileStorageMounter waits on diskimagesiod's `-[DIDiskArb waitForDAMountWithExpectedCount:diskTracker:]` before it does the real (nobrowse) mount at `/System/Developer`. That wait loops until `isMountComplete` (= `callbackReached \|\| (appearedDiskCount>=expectedCount && mountedDiskCount>=mountableDiskCount)`) is YES; on the 26.4-kernel / 27-userland hybrid it never becomes true (not all of the DMG's IOMedia "appear" to diskimagesiod's DiskArbitration session, and diskarbitrationd never auto-mounts the volume), so the wait hangs and pmd3 times out. diskimagesiod itself does NOT mount the DDI (its `-[DIDiskArb mountWithDeviceName:...]` is dead code) — it only gates MobileStorageMounter. Forcing `isMountComplete` → YES lets the wait return so MobileStorageMounter proceeds. IMP resolved via LC_SYMTAB or ObjC metadata (selector → `__objc_selrefs` → `__TEXT,__objc_methlist` relative method list → IMP); prologue overwritten `mov x0,#1 ; ret` (safe — the method returns to the caller's unsigned LR without pushing a frame). **Gated to 27.\*** in `cfw_install.sh` (same `$IOS_VERSION` as the DSC patches): on a version-matched userland the native wait completes correctly and forcing it early could race the real mount, so it is NOT applied there. Embedded sandbox profile + private DA/apfs entitlements preserved on re-sign (`ldid_sign_ent`). **Validated on `c0ecdb4b` 26.4 + 27.0 userland: `pmd3 mounter auto-mount` → rc=0, DDI at `/System/Developer`, idempotent across fresh boots.** See `scripts/patchers/cfw_patch_diskimagesiod.py`. |    Y    |  Y  |  Y  |
 | 14  | Merge backboard/frontboard launch mach-services into `com.apple.security.exception.mach-lookup.global-name` + `ldid_sign_ent` re-sign — **iOS 27.0** | `/Applications/Campo.app/Campo` | **iOS-27 Campo (wallpaper renderer) crash-loop fix — sandbox half.** Campo declares `com.apple.private.sandbox.profile:embedded = temporary-sandbox` + `no-container`, so it runs under the `temporary-sandbox` profile. On the 26.4 vphone600 kernel that builtin profile predates iOS 27 and DENIES the `mach-lookup` of the backboard/frontboard launch services, so `BKSDisplayServicesStart` (looks up `com.apple.backboard.display.services`) and then `+[BKSHIDEventDeliveryManager sharedInstance]` (HID) fail, log *"backboardd isn't running -- or we couldn't talk to it"*, and `brk #0` ~34 ms after launch → continuous crash-loop, no wallpaper (launchd eventually throttles it off). **JB-02d is NOT sufficient here:** it stops the exec-time container-manager-upcall autobox *KILL*, but Campo is still placed in `temporary-sandbox` (its own declared profile — confirmed the JB-02d `b`-flip is present in the running kernel yet Campo still traps), and that profile still denies the lookups. Fix: append the needed services to Campo's OWN `com.apple.security.exception.mach-lookup.global-name` array — the Apple-sanctioned escape hatch, which `temporary-sandbox` honors (Campo already ships ~20 such exceptions; these launch services simply aren't among them because 27's profile allows them directly). Services added (backboard names exact, from `com.apple.backboardd.plist` MachServices): `com.apple.backboard.display.services`, `com.apple.iohideventsystem`, `com.apple.CARenderServer`, `com.apple.backboard.hid.services`, `com.apple.backboard.hid-services.xpc`, `com.apple.backboard.TouchDeliveryPolicyServer`, `com.apple.backboard.system-app-server`, `com.apple.backboard.watchdog`, `com.apple.backboard.oswatchdog`, `com.apple.backboard.altsysapp`, `com.apple.AttentionAwareness`, `PurpleSystemEventPort`, `PurpleWorkspacePort`, `com.apple.frontboard.systemappservices`, `com.apple.frontboard.workspace`, `com.apple.frontboardservices.systemappmanager`, `com.apple.frontboard.watchdog`. Merge is done by the external helper `scripts/patchers/campo_mach_lookup_exceptions.py` (Python `plistlib`, not `plutil` — the entitlement key contains dots that `plutil` keypaths would mis-split; idempotent, preserves the existing array); re-signed with the JB `signcert.p12` via `ldid_sign_ent` (AMFI enforcement is relaxed on the research VM, so the re-signed cdhash loads and the entitlements are honored). Applied at host-mount build time in `cfw_install_jb.sh` / `cfw_install_exp.sh` step **[JB-3b]**, **hard-gated to `27.*`** via the mounted rootfs `SystemVersion.plist` `ProductVersion` (same gate as the vpregister/DSC patches) — skipped entirely on 26.x/18.x, which don't need it and where `Campo.app` also exists. **VALIDATED on-device (2026-07-21, `17,3_27.0_24A5390f` + cloudOS 26.4, JB): Campo launches and stays up (stable pid, no BKSDisplayServicesStart/BKSHIDEventDeliveryManager trap, no crash-loop); first-cut display-only exception advanced the trap from display→HID, confirming the mechanism, then the full service set cleared it.** See `scripts/cfw_install_jb.sh` / `scripts/cfw_install_exp.sh` step JB-3b and the merge helper `scripts/patchers/campo_mach_lookup_exceptions.py`. |    -    |  -  |  Y  |
 | 15  | Derive `matched` from `error_code` + drop the `brk #1` in libxpc `_xpc_token_satisfies_lwcr` (`cset w8,ne; eor w8,w0,w8; tbz w8,#0` → `cset w0,eq; nop; nop`) + per-page re-attest — **iOS 27.0** | DSC `libxpc.dylib` | **iOS-27 daemon crash-loop fix (Lightweight Code Requirement).** iOS 27 lets an XPC server pin a "lightweight code requirement" (LWCR) on its listener — `xpc_connection_set_peer_lightweight_code_requirement`, or the Swift `XPCPeerRequirement.hasEntitlement(_:)` wrapper (→ `xpc_peer_requirement_create_entitlement_exists` → `_xpc_peer_requirement_create_lwcr_entitlement_requirement` → `xpc_peer_requirement_create_lwcr`). Creating the requirement runs a self-check, `_xpc_token_satisfies_lwcr`, which calls an internal matcher returning a `matched` bool (w0) plus a `match_result.error_code` (`AICMR_MATCH == 0`), then hard-asserts they agree (`matched == (error_code == 0)`) via `_os_crash_msg` → `brk #1`. On stock iOS the two always agree; under our JB code-signing environment the matcher's query writes `error_code = MATCH(0)` yet returns a failure status, so the matcher yields the forbidden `(matched=0, error_code=0)` pair and libxpc aborts. Because EVERY daemon that pins an entitlement peer-requirement at startup hits it, `intelligencetasksd` / `searchpartyd` / `transparencyd` / `bluetoothd` (and others) crash-loop continuously from boot (launchd re-spawn + ReportCrash churn). Fix: recompute `matched` from `error_code` and make the abort unreachable — `cset w8,ne; eor w8,w0,w8; tbz w8,#0,<abort>` → `cset w0,eq; nop; nop`; the function now returns `(error_code == 0)`, which reproduces stock's verdict when the two agree and resolves the contradiction toward "satisfied" when error_code says MATCH (real allow/deny for genuinely (un)satisfied peers is unchanged, since those set `error_code` != 0). Fully dynamic: resolved via the DSC's own `.symbols` in-image local-symbol table as `__xpc_token_satisfies_lwcr` (the double-underscore mangled name; a single-underscore lookup silently skipped every iOS-27 build until fixed 2026-08-11), the check located by control-flow shape in Capstone (`cset wC,ne; eor wE,w0,wC; tbz wE,#0`), replacements from Keystone, modified 16 KiB page re-attested (`cfw_dsc_codesign.py`; TXM enforces per-page; CDHash change accepted by the JB always-true AMFI cdhash-trust patch). Install gate: **`27.*`** (in `cfw_install.sh`, same block as maxSlide/lsd). Patcher additionally self-gates (`patch-xpc-lwcr`): no-op on pre-iOS-27 userlands where the symbol is absent. **VALIDATED on-device (2026-07-22, `17,3_27.0_24A5390f` + cloudOS 26.4, JB, host-mount deploy): patched bytes live (`e0179f1a 1f2003d5 1f2003d5`); the four LWCR crash-loopers disappear from the crash census after boot; launchd itself (which links libxpc) boots clean past first unlock — patch does not brick boot. NOTE: does NOT stop the resprings — those are a separate `FileProviderResolver` ResolverService memory-balloon → jetsam → backboardd kill (see investigation notes).** See `scripts/patchers/cfw_patch_xpc_lwcr.py`. **FIX (2026-09-22):** same idempotence gap as row 12, and for the same structural reason: `_find_consistency_check` searches for `cset wC,ne; eor wE,w0,wC; tbz wE,#0`, which is precisely the idiom this patch replaces, so on a cache it had already patched the search returned `None` and raised `ValueError: LWCR consistency idiom ... not found`. The per-edit `already patched` byte comparison further down could never run, because it needs the addresses that search has to supply first. Hit live on `17,3_27.0_24A435` (RC) + cloudOS 26.4, JB, host-mount flow, when a first `cfw_install_host` pass completed phase 1/7 and then failed later at JB-1 (missing `insert_dylib`); the retry died here. Confirmed by read-only host-mount disassembly of `__xpc_token_satisfies_lwcr` @ `0x1805DD5BC`: `cmp w8,#0; cset w0,eq; nop; nop` — already patched. A new `_find_patched_shape` now recognizes that post-patch shape (`cset w0,eq` + two `nop`s, anchored on the `cmp wX,#0` that feeds it) and returns a no-op instead of raising. Checked against the live cache (dry run returns rather than raises) and with negative controls: fed the pre-patch stream the detector stays silent and the normal idiom search still matches, so the patching path is intact on a pristine cache. |    Y    |  Y  |  Y  |
 | 16  | NOP the sysctl-error `b.eq <os_crash>` in libSystem `___os_lockdown_mode_enabled_block_invoke` (`cmn w0,#1; b.eq <crash>` → `nop`) + per-page re-attest — **iOS 27.0** | DSC `libSystem` (`lockdown_mode.c`) | **iOS-27 launchd (pid 1) boot-panic fix.** iOS 27's `os_lockdown_mode_enabled()` resolves Lockdown Mode once via `sysctlbyname("security.mac.lockdown_mode_state_public", &out, &len, 0, 0)`; on a -1 return it `os_crash`es (`lockdown_mode.c:os_lockdown_mode_enabled_block_invoke:47`). The vphone base kernel (cloudOS 26.x) does not implement that MAC sysctl, so the call returns -1/ENOENT and the first process to query Lockdown Mode after "Continuing system boot" aborts — that process is launchd (pid 1), so the kernel panics `initproc exited -- exit reason namespace 2 subcode 0x6 description: none`. b4 (24A5390f) boots on the same kernel; the sysctl query is new in b5 (24A5408d). The block pre-zeroes its output buffer (`stp x8, xzr, [sp]`), so NOPping the error branch falls through to the normal path, reads 0, records "Lockdown Mode disabled", and returns cleanly; on a kernel that implements the sysctl the branch is never taken (w0==0), so the patch is behavior-neutral. Dynamic: `___os_lockdown_mode_enabled_block_invoke` resolved via the DSC's own `.symbols` local-symbol table; the `cmn wR,#1; b.eq` sysctl-error idiom located by control-flow shape in Capstone; NOP from Keystone; modified 16 KiB page re-attested (`cfw_dsc_codesign.py`). Install gate: **`27.*`** (same block as maxSlide/lsd/lwcr). Self-gates: no-op where the symbol is absent (pre-iOS-27 userlands). **Root-caused + verified on-device 2026-08-11** (`17,3_27.0_24A5408d` + cloudOS 26.4, JB): abort message read live via the kernel GDB stub (patched `_abort`→`b .` to freeze launchd's spinning vCPU, then read its registers + the libSystem crash-info global) = `lockdown_mode.c:os_lockdown_mode_enabled_block_invoke:47: No such file or directory`; with the NOP applied the panic is gone and boot continues past "Got first unlock" into normal daemon startup. See `scripts/patchers/cfw_patch_lockdown_mode.py`. **FIX (2026-09-22):** third instance of the row-12 idempotence gap, found immediately after the row-15 one on the same `17,3_27.0_24A435` (RC) + cloudOS 26.4 JB host-mount re-run. `_find_error_gate` required the slot after `cmn wR,#1` to be a `b.eq`; once patched it holds the `nop` this patch writes, so the search returned `None` and raised `ValueError: ... sysctl-error gate not found` — again before the `cur == nop` byte comparison below it could ever be reached. Confirmed by read-only host-mount disassembly of `___os_lockdown_mode_enabled_block_invoke` @ `0x237EF2260`: `bl <sysctlbyname>; cmn w0,#1; nop` at `0x237EF2298`. The gate slot now also matches `nop`, which lets the existing byte comparison report the already-patched state; the `bl` + `cmn wR,#1` anchor is unchanged, and re-writing a NOP over a NOP is inert. Negative controls checked: an unrelated instruction in the slot, a `cmn` with no preceding `bl`, and a `cmn` with the wrong immediate are all still rejected, and the pre-patch stream still resolves to the `b.eq`. |    Y    |  Y  |  Y  |
-| 17  | `mov x0,#0 ; retab` over the two instructions after the prologue `pacibsp` of `checkTrustAndAuthorization` — **all bases** | DSC `libmis.dylib` | **Free-certificate app-launch fix (online authorization).** A guest restored by this project is hacktivated — `mobileactivationd.should_hactivate` forces `-[DeviceType should_hactivate]` to YES so the VM never contacts Apple's activation service. The consequence nobody had traced until now is that it also never receives an **activation record**: `/private/var/root/Library/Lockdown/` holds `data_ark.plist`, `escrow_records` and `pair_records` but no `activation_records/`, while `data_ark.plist` still says `-ActivationStateAcknowledged = true`. With no activation record there is no device identity to sign an authorization request with, so the chain is `online-auth-agent: Failed to copy activation record.` (MobileActivation `-1`) → `Couldn't get device identity … "online-auth-agent is not allowed to use this API."` (MobileActivation `-25`) → `Could not perform authorization attempt`, and `Preferences: MDMProvisioningProfileTrust failed to verify provisioning profile <uuid> with error 4`. libmis's `checkTrustAndAuthorization` therefore returns `0xE8008026`, which SpringBoard reports as `validation failed because of missing trust and/or authorization (0xe8008026)` followed by `signature state: Profile Needs Network Validation, reason: Requires Network Validation`, and FrontBoard refuses the launch (`FBSOpenApplicationErrorDomain 3`, *"…or its profile has not been explicitly trusted by the user"*). **This only bites free personal-team profiles**; a paid team's profile is not marked as needing online authorization, and Settings' "Verify App" can never clear the free one because the network step it offers is exactly the step that cannot complete. **Not to be confused with `0xE8008012`** (`misagent: attempt to install invalid profile`), which is the ordinary "this UDID is not in the profile's `ProvisionedDevices`" refusal and is correct behaviour — installation itself needs no patch. Fix: short-circuit `checkTrustAndAuthorization` to return success. Its prologue seeds the failure code into the register it returns (`mov w21,#0x8026 ; movk w21,#0xe800,lsl #16`) and the body subtracts its way to the neighbouring MIS errors (`sub w21,w21,#0x2` → `0xE8008024`, `#0x25` → `0xE8008001`, `#0x9` → `0xE800801D`) or replaces it with 0; both call sites inside `MISValidateSignatureAndCopyInfoWithProgress` treat 0 as success. The two instructions after the prologue's `pacibsp` (`sub sp,sp,#0xa0` and `stp x28,x27,[sp,#0x40]`) become `mov x0,#0 ; retab`. **`pacibsp` is deliberately kept** rather than overwritten: it signs LR with SP as the modifier and `retab` authenticates against the SP it sees, so returning before the frame is built leaves the pair balanced — a plain `ret` over `pacibsp` would also work but makes the larger claim. The optional out-parameter is safe to leave unwritten: one caller passes NULL for it outright (`mov x5,#0`), the other pre-zeroes the slot (`str xzr,[sp,#0x68]`) and skips the merge while it is still NULL (`cbz x8`). Fully dynamic, and the function is **static — it carries no symbol**, so neither the cache's `.symbols` table nor `ipsw symaddr` can name it: it is anchored instead on the log string that names it outright, `"cdHash (%p) or matchedProfileIDs (%p) NULL in checkTrustAndAuthorization"` (one of four `checkTrustAndAuthorization` / `checking trust and authorization` literals, all four of which xref inside this one function), whose containing image is confirmed to be `/usr/lib/libmis.dylib` via `findMachOHeaderBefore` + `readInstallName`; the ADRP+ADD pair that materialises the literal is matched on Capstone operand semantics, the nearest preceding `pacibsp` gives the function start, and that prologue is then **required** to seed `0xE8008026` within 48 instructions before anything is written — two independent routes that must agree, in the manner of `CustomFirmwareMobileActivation.locateIMP`. Replacement bytes are `ARM64.movX0_0` + `ARM64.retab`, both existing keystone-checked constants (no new encoder, no keystone trip). Modified 16 KiB page re-attested. **Install gate: none** — the guest is hacktivated on every base, so the failure exists on every base; the declaration (`dyld-cfw-mis_trust_auth`, in `com.vphone.patchset.guest.system`) carries no `applicability` and is not `bootEssential`. Self-gating: a cache whose libmis lacks the naming literal reports absent and exits 0, an already-patched cache is a no-op (the byte comparison is against this patch's own output), and a cache with the literal but **neither** the seeding prologue **nor this patch's own `pacibsp ; mov x0, #0 ; retab`** is an **error** rather than a guess. **The second half of that sentence is a fix, made 2026-09-30 for issue #532, and it matters:** `locateSite` originally *required* the seed, and the seed is not guaranteed to outlive the write. On the 26.6.2 cache the compiler puts it at `functionVMA + 0x4C` (`checkTrustAndAuthorization @ 0x1BC6AE364`, seed at `0x1BC6AE3B0`), well clear of the two words at `+4`, so the byte comparison saw its own output and a second `cfw install` was already a no-op. On the 27.0 guest in the report the seed *was* the two words this patch overwrites (`checkTrustAndAuthorization @ 0x22406F814`), the first run destroyed it, and every later run died with `Patch site not found: … does not seed 0xE8008026 — MIS has been rewritten`, taking the whole install down after `dsc_maxslide` and before everything that follows. `DyldSharedCacheMISTrustAuthPatcher.isShortCircuited` now recognises the patch's own three words off the Capstone decode (`pacibsp`, `mov` with decoded destination `x0` and decoded immediate 0, `retab`) — the same "recognise your own output" fix `DyldSharedCacheXPCLWCRPatcher.findPatchedShape` and `DyldSharedCacheLockdownModePatcher.findErrorGate` got on 2026-09-22 — and `Site.shape` now carries `.seedsFailure(seedVMA:resultRegister:)` or `.alreadyShortCircuited` instead of a non-optional seed address. The genuine "MIS has been rewritten" hard failure is unchanged for a prologue that is neither shape. Covered by `DyldSharedCacheMISTrustAuthPatcherTests`, which builds a synthetic one-chunk cache (mapping table, `LC_ID_DYLIB` = `/usr/lib/libmis.dylib`, the naming literal, an ADRP+ADD that materialises it, and a real `CS_CodeDirectory` with SHA-256 page slots) in **both** seed layouts, because the 24A435 fixture can only exhibit the one that already worked. **VALIDATED on-device (2026-09-30, `iPhone17,3 26.6.2 (23G90)` + cloudOS 26.4 (23E5207q), JB, fresh `vm new` → `fw patch` → `restore` → `cfw install` into a new VM `05-mis-test`): an app signed with a free personal-team certificate now installs, verifies, launches, and Xcode `attach` to it succeeds.** The shape was first derived statically, from the `libmis.dylib` Xcode extracted from the live guest `01-use-me-rh` (`iPhone99,11 26.6.2 (23G90)` + cloudOS 26.4) into `iOS DeviceSupport/…/Symbols/usr/lib/`, where the two `#0x8026` immediates in the entire library are both inside this function; the patcher then reached exactly that site through the DSC chunk path, with both routes agreeing — `checkTrustAndAuthorization @ 0x1BC6AE364 in /usr/lib/libmis.dylib`, named by the literal referenced at `0x1BC6AE6B4`, prologue seeding `w21=0xE8008026` at `0x1BC6AE3B0`, written at `0x1BC6AE368` — and one 16 KiB page re-attested (slot 3260 of `dyld_shared_cache_arm64e.19`). The guest then booted normally through Setup Assistant to the home screen, so TXM accepts the re-attested page: the patch does not brick boot **on 26.6.2**. **It does on 27.0** (issue #532, `17,3_27.0_24A435` + cloudOS `26.4-23E5207q`): `TXM [Error]: Errno: selector: 45 | 78`, then `dyld[1]: Library not loaded: /usr/lib/libSystem.B.dylib … (no such file, no dyld cache)`, then `initproc failed to start`. Excluding only `mis_trust_auth` boots. That is not reproducible here — no 27.0 guest exists on this machine — so it is reported, not measured. **The direction taken is to stop editing the cache for this and express the same behaviour as a userspace hook instead**, and the disassembly says that is possible *without* rewriting any return value, because the whole branch is reachable from the caller's options dictionary. Read off libmis on `01-use-me-rh` (`iPhone99,11 26.6.2 (23G90)`, `MISValidateSignatureAndCopyInfoWithProgress @ 0x1BC6ABA4C`): the options are parsed into stack bytes by a `getBoolOption(dict, CFStringRef, char *out)` helper (`0x1BC674C60`) that **writes only when the key is present**, so every flag defaults to 0; `UnauthoritativeLaunch` or `AuthoritativeLaunch` then force `RespectUppTrustAndAuthorization = 1`, `HonorBlocklist = 1`, `ValidateSignatureOnly = 1`, `OnlineAuthorization = 0` as a *default set* that an explicit key still overrides; the explicit `RespectUppTrustAndAuthorization` read lands in `[sp+0x97]`, and `checkTrustAndAuthorization` is **only called at all** when the word derived from it (`[sp+0x2C]`) is nonzero — `ldr w8,[sp,#0x2c] ; cbz w8, <skip>` immediately before the call at `0x1BC6ACCE8`. Passing `RespectUppTrustAndAuthorization = kCFBooleanFalse` therefore skips the call, and `0xE8008026` cannot be produced on this path. Inside the callee the same flag arrives twice — `w4` gates the trust/authorization tests that re-seed `0xE8008026`, `w3` (`respectUpp && !predicate`) gates the second test whose failure yields `0xE8008025` — and `w2` is `HonorBlocklist`, forwarded to `appApprovalState`, whose states map to `0xE8008024` (2), `0xE800801D` (4) and `0xE8008001` (unknown). One route already exists in stock code: at `0x1BC6ABEE4` libmis asks MobileGestalt `IsVirtualDevice` and, when that is true **and** a second answer compares equal to `CFSTR("Internal")`, forces `RespectUppTrustAndAuthorization = 0` and `OnlineAuthorization = 0` outright — worth probing before any hook is written. **A hook must steer the call, not the return:** on the `0xE8008026` path the function logs `validation failed because of missing trust and/or authorization (0x%x)` and branches straight to the shared cleanup at `0x1BC6ABB48`, which releases and returns the status **without ever writing the `info` out-parameter** — the dictionary carrying `CdHash`, `Entitlements`, `SignerType`, `TeamID`, `SigningID`, `ProfileUUID` and the rest is built only on the success path at `0x1BC6ACF74`. Rewriting the return code to 0 would hand the caller success with an untouched `info`. See `DyldSharedCacheMISTrustAuthPatcher` and the `cfw patch-mis-trust-auth` verb. |    Y    |  Y  |  Y  |
+| 17  | `mov x0,#0 ; retab` over the two instructions after the prologue `pacibsp` of `checkTrustAndAuthorization` — **all bases** | DSC `libmis.dylib` | **Free-certificate app-launch fix (online authorization).** A guest restored by this project is hacktivated — `mobileactivationd.should_hactivate` forces `-[DeviceType should_hactivate]` to YES so the VM never contacts Apple's activation service. The consequence nobody had traced until now is that it also never receives an **activation record**: `/private/var/root/Library/Lockdown/` holds `data_ark.plist`, `escrow_records` and `pair_records` but no `activation_records/`, while `data_ark.plist` still says `-ActivationStateAcknowledged = true`. With no activation record there is no device identity to sign an authorization request with, so the chain is `online-auth-agent: Failed to copy activation record.` (MobileActivation `-1`) → `Couldn't get device identity … "online-auth-agent is not allowed to use this API."` (MobileActivation `-25`) → `Could not perform authorization attempt`, and `Preferences: MDMProvisioningProfileTrust failed to verify provisioning profile <uuid> with error 4`. libmis's `checkTrustAndAuthorization` therefore returns `0xE8008026`, which SpringBoard reports as `validation failed because of missing trust and/or authorization (0xe8008026)` followed by `signature state: Profile Needs Network Validation, reason: Requires Network Validation`, and FrontBoard refuses the launch (`FBSOpenApplicationErrorDomain 3`, *"…or its profile has not been explicitly trusted by the user"*). **This only bites free personal-team profiles**; a paid team's profile is not marked as needing online authorization, and Settings' "Verify App" can never clear the free one because the network step it offers is exactly the step that cannot complete. **Not to be confused with `0xE8008012`** (`misagent: attempt to install invalid profile`), which is the ordinary "this UDID is not in the profile's `ProvisionedDevices`" refusal and is correct behaviour — installation itself needs no patch. Fix: short-circuit `checkTrustAndAuthorization` to return success. Its prologue seeds the failure code into the register it returns (`mov w21,#0x8026 ; movk w21,#0xe800,lsl #16`) and the body subtracts its way to the neighbouring MIS errors (`sub w21,w21,#0x2` → `0xE8008024`, `#0x25` → `0xE8008001`, `#0x9` → `0xE800801D`) or replaces it with 0; both call sites inside `MISValidateSignatureAndCopyInfoWithProgress` treat 0 as success. The two instructions after the prologue's `pacibsp` (`sub sp,sp,#0xa0` and `stp x28,x27,[sp,#0x40]`) become `mov x0,#0 ; retab`. **`pacibsp` is deliberately kept** rather than overwritten: it signs LR with SP as the modifier and `retab` authenticates against the SP it sees, so returning before the frame is built leaves the pair balanced — a plain `ret` over `pacibsp` would also work but makes the larger claim. The optional out-parameter is safe to leave unwritten: one caller passes NULL for it outright (`mov x5,#0`), the other pre-zeroes the slot (`str xzr,[sp,#0x68]`) and skips the merge while it is still NULL (`cbz x8`). Fully dynamic, and the function is **static — it carries no symbol**, so neither the cache's `.symbols` table nor `ipsw symaddr` can name it: it is anchored instead on the log string that names it outright, `"cdHash (%p) or matchedProfileIDs (%p) NULL in checkTrustAndAuthorization"` (one of four `checkTrustAndAuthorization` / `checking trust and authorization` literals, all four of which xref inside this one function), whose containing image is confirmed to be `/usr/lib/libmis.dylib` via `findMachOHeaderBefore` + `readInstallName`; the ADRP+ADD pair that materialises the literal is matched on Capstone operand semantics, the nearest preceding `pacibsp` gives the function start, and that prologue is then **required** to seed `0xE8008026` within 48 instructions before anything is written — two independent routes that must agree, in the manner of `CustomFirmwareMobileActivation.locateIMP`. Replacement bytes are `ARM64.movX0_0` + `ARM64.retab`, both existing keystone-checked constants (no new encoder, no keystone trip). Modified 16 KiB page re-attested. **Install gate: none, but OFF in `standard` since 2026-09-30** — the guest is hacktivated on every base, so the failure exists on every base; the declaration (`dyld-exp-mis_trust_auth`, in `com.vphone.patchset.guest.system`, renamed from `dyld-cfw-` when it left `standard`) carries no `applicability` and is not `bootEssential`. See "The MIS online-authorization patch leaves `standard`" at the end of this document for why it is now opt-in and what replaced it. Self-gating: a cache whose libmis lacks the naming literal reports absent and exits 0, an already-patched cache is a no-op (the byte comparison is against this patch's own output), and a cache with the literal but **neither** the seeding prologue **nor this patch's own `pacibsp ; mov x0, #0 ; retab`** is an **error** rather than a guess. **The second half of that sentence is a fix, made 2026-09-30 for issue #532, and it matters:** `locateSite` originally *required* the seed, and the seed is not guaranteed to outlive the write. On the 26.6.2 cache the compiler puts it at `functionVMA + 0x4C` (`checkTrustAndAuthorization @ 0x1BC6AE364`, seed at `0x1BC6AE3B0`), well clear of the two words at `+4`, so the byte comparison saw its own output and a second `cfw install` was already a no-op. On the 27.0 guest in the report the seed *was* the two words this patch overwrites (`checkTrustAndAuthorization @ 0x22406F814`), the first run destroyed it, and every later run died with `Patch site not found: … does not seed 0xE8008026 — MIS has been rewritten`, taking the whole install down after `dsc_maxslide` and before everything that follows. `DyldSharedCacheMISTrustAuthPatcher.isShortCircuited` now recognises the patch's own three words off the Capstone decode (`pacibsp`, `mov` with decoded destination `x0` and decoded immediate 0, `retab`) — the same "recognise your own output" fix `DyldSharedCacheXPCLWCRPatcher.findPatchedShape` and `DyldSharedCacheLockdownModePatcher.findErrorGate` got on 2026-09-22 — and `Site.shape` now carries `.seedsFailure(seedVMA:resultRegister:)` or `.alreadyShortCircuited` instead of a non-optional seed address. The genuine "MIS has been rewritten" hard failure is unchanged for a prologue that is neither shape. Covered by `DyldSharedCacheMISTrustAuthPatcherTests`, which builds a synthetic one-chunk cache (mapping table, `LC_ID_DYLIB` = `/usr/lib/libmis.dylib`, the naming literal, an ADRP+ADD that materialises it, and a real `CS_CodeDirectory` with SHA-256 page slots) in **both** seed layouts, because the 24A435 fixture can only exhibit the one that already worked. **VALIDATED on-device (2026-09-30, `iPhone17,3 26.6.2 (23G90)` + cloudOS 26.4 (23E5207q), JB, fresh `vm new` → `fw patch` → `restore` → `cfw install` into a new VM `05-mis-test`): an app signed with a free personal-team certificate now installs, verifies, launches, and Xcode `attach` to it succeeds.** The shape was first derived statically, from the `libmis.dylib` Xcode extracted from the live guest `01-use-me-rh` (`iPhone99,11 26.6.2 (23G90)` + cloudOS 26.4) into `iOS DeviceSupport/…/Symbols/usr/lib/`, where the two `#0x8026` immediates in the entire library are both inside this function; the patcher then reached exactly that site through the DSC chunk path, with both routes agreeing — `checkTrustAndAuthorization @ 0x1BC6AE364 in /usr/lib/libmis.dylib`, named by the literal referenced at `0x1BC6AE6B4`, prologue seeding `w21=0xE8008026` at `0x1BC6AE3B0`, written at `0x1BC6AE368` — and one 16 KiB page re-attested (slot 3260 of `dyld_shared_cache_arm64e.19`). The guest then booted normally through Setup Assistant to the home screen, so TXM accepts the re-attested page: the patch does not brick boot **on 26.6.2**. **It does on 27.0** (issue #532, `17,3_27.0_24A435` + cloudOS `26.4-23E5207q`): `TXM [Error]: Errno: selector: 45 | 78`, then `dyld[1]: Library not loaded: /usr/lib/libSystem.B.dylib … (no such file, no dyld cache)`, then `initproc failed to start`. Excluding only `mis_trust_auth` boots. That is not reproducible here — no 27.0 guest exists on this machine — so it is reported, not measured. **The direction taken is to stop editing the cache for this and express the same behaviour as a userspace hook instead**, and the disassembly says that is possible *without* rewriting any return value, because the whole branch is reachable from the caller's options dictionary. Read off libmis on `01-use-me-rh` (`iPhone99,11 26.6.2 (23G90)`, `MISValidateSignatureAndCopyInfoWithProgress @ 0x1BC6ABA4C`): the options are parsed into stack bytes by a `getBoolOption(dict, CFStringRef, char *out)` helper (`0x1BC674C60`) that **writes only when the key is present**, so every flag defaults to 0; `UnauthoritativeLaunch` or `AuthoritativeLaunch` then force `RespectUppTrustAndAuthorization = 1`, `HonorBlocklist = 1`, `ValidateSignatureOnly = 1`, `OnlineAuthorization = 0` as a *default set* that an explicit key still overrides; the explicit `RespectUppTrustAndAuthorization` read lands in `[sp+0x97]`, and `checkTrustAndAuthorization` is **only called at all** when the word derived from it (`[sp+0x2C]`) is nonzero — `ldr w8,[sp,#0x2c] ; cbz w8, <skip>` immediately before the call at `0x1BC6ACCE8`. Passing `RespectUppTrustAndAuthorization = kCFBooleanFalse` therefore skips the call, and `0xE8008026` cannot be produced on this path. Inside the callee the same flag arrives twice — `w4` gates the trust/authorization tests that re-seed `0xE8008026`, `w3` (`respectUpp && !predicate`) gates the second test whose failure yields `0xE8008025` — and `w2` is `HonorBlocklist`, forwarded to `appApprovalState`, whose states map to `0xE8008024` (2), `0xE800801D` (4) and `0xE8008001` (unknown). One route already exists in stock code: at `0x1BC6ABEE4` libmis asks MobileGestalt `IsVirtualDevice` and, when that is true **and** a second answer compares equal to `CFSTR("Internal")`, forces `RespectUppTrustAndAuthorization = 0` and `OnlineAuthorization = 0` outright — worth probing before any hook is written. **A hook must steer the call, not the return:** on the `0xE8008026` path the function logs `validation failed because of missing trust and/or authorization (0x%x)` and branches straight to the shared cleanup at `0x1BC6ABB48`, which releases and returns the status **without ever writing the `info` out-parameter** — the dictionary carrying `CdHash`, `Entitlements`, `SignerType`, `TeamID`, `SigningID`, `ProfileUUID` and the rest is built only on the success path at `0x1BC6ACF74`. Rewriting the return code to 0 would hand the caller success with an untouched `info`. **That hook now exists and ships** — `libmisfix.dylib` (`VPhoneGuestComponents/MISFix/MISFixSignature.c`) passes `RespectUppTrustAndAuthorization = kCFBooleanFalse` alongside `AllowAdHocSigning`, and `cfw install` injects it into `installd` and `misagent` — which is why this patch left `standard`. See `DyldSharedCacheMISTrustAuthPatcher` and the `cfw patch-mis-trust-auth` verb. |    Y    |  Y  |  Y  |
 | 18  | `LC_LOAD_WEAK_DYLIB /usr/lib/libmisfix.dylib` injected into `installd`, which interposes `MISValidateSignatureAndCopyInfo` and `MISValidateSignatureAndCopyInfoWithProgress` — **all bases** | `/usr/libexec/installd` (+ new guest dylib `libmisfix.dylib`) | **Xcode-install fix: let the guest install an app it did not get from Apple.** `xcrun devicectl device install app` with a bundle that is ad-hoc signed, fake-signed or signed by anything other than an Apple leaf fails at `0xE8008014`. Measured, not inferred: a probe app linked against `libmis` on `05-mis-test` (`iPhone99,11 26.6.2 (23G90)` + cloudOS 26.4) walked the option matrix over a real `.app` and found that **the whole gate is this one call** — no options → `0xE8008014`; `AllowAdHocSigning = kCFBooleanTrue` → **`0x0` with a complete `info` dictionary** (`CdHash`, `SignerType`, `SigningID`, `TeamID`, `SignatureVersion`, `IsNativeForPlatform`), so the hook has to synthesise nothing and the `info`-out-parameter hazard that rules out rewriting row 17's return value does not arise here; and stripping the signature off entirely is *not* a way through — that stays `0xE800801C` even with the option. Everything behind the call already accepts uncertificated code on a CFW guest (kernel AMFI, `lsd`, SpringBoard), so nothing else needs patching. Two findings cost real time and are recorded so nobody repeats them: **the first argument is a path `CFStringRef`, not a `CFURLRef`** — passing a URL crashes the caller with `-[NSURL length]: unrecognized selector`; and **the option keys are plain `CFString`s, not exported symbols** — `kMISValidationOptionAllowAdHocSigning` is absent from the cache's export trie, so grepping for the symbol says "this option does not exist on 26.6.2", which is wrong. The keys `libmis` parses are `UnauthoritativeLaunch`, `AuthoritativeLaunch`, `ExpectedHash`, `AllowAdHocSigning`, `ValidateSignatureOnly`, `LogResourceErrors`, `UniversalFileOffset`, `UseSoftwareSigningCert`, `OnlineAuthorization`, `OnlineCheckType`, `RespectUppTrustAndAuthorization`, `HonorBlocklist`, `DetachedSignature`, `TrustCacheOnly`, `SkipProfileIdentifierPolicy`, `AllowLaunchWarnings`, `GetLocalLaunchWarningData`, `MainExecutablePath` and `OnlineAuthorizationOnAllMatchingProfiles`. Fix: `vpWidenedOptions` copies the caller's dictionary (or creates one when it is NULL), sets `AllowAdHocSigning = true` and `RespectUppTrustAndAuthorization = false`, and forwards. The second key is row 17's behaviour expressed from the caller's side — same outcome, **no cache page written and no re-attestation**, which is the whole point given that row 17 is what bricks a 27.0 boot (issue #532). Delivery is `dyld` interposition: `__DATA,__interpose` lands in `__AUTH_CONST` on arm64e (signed pointers) and dyld honours it anyway, including for the shared cache's own uses of the interposed symbol — measured on `05-mis-test`, a linked call with no options returns `0x0` hooked against `0xE8008014` unhooked. The dylib is built by `VPhoneGuestComponents/Makefile` against `libmis.tbd` and `libMobileGestalt`, with `-Wl,-not_for_dyld_shared_cache`, and installed as `/usr/lib/libmisfix.dylib`; injection goes through the existing `patchMachO(… injectedDylibPath:)` path, which captures entitlements before the edit and re-signs with `VPhoneSigner` afterwards — verified to preserve `com.apple.installd` and all 31 of installd's entitlements. **Not applied to SpringBoard**, which would close the free-personal-team *launch* gate the same way: SpringBoard's Mach-O has no free header space (`load-command padding at 0x548 is not empty; inserting would overwrite 56 bytes of the first section`), so that path needs the `SystemHook` `posix_spawn` route instead and row 17 remains the only fix for it today. Declared `system-installd-cfw-adhoc_signature` in `com.vphone.patchset.guest.system`; no `applicability`, not `bootEssential`, on in `standard`. **Partially validated (2026-09-30, `06-xcode-27`, `17,3 27.0 (24A435)` + cloudOS 26.4 (23E5207q)):** `cfw install` reports `[+] LC_LOAD_WEAK_DYLIB /usr/lib/libmisfix.dylib -> installd`, the guest boots through Setup Assistant to the home screen, and `installd` is running with the dylib loaded — so the injection breaks neither the daemon nor the boot. The end-to-end install has **not** been demonstrated on that guest: `devicectl` will not complete a session against it on this host (`device info details` hangs with nothing reaching `lockdownd`), which is a host-side CoreDevice problem unrelated to this patch. See `VPhoneGuestComponents/MISFix/MISFixSignature.c` and `Research/Guest/xcode_install_signature_gate.md`. |    Y    |  Y  |  Y  |
 | 19  | The same `libmisfix.dylib` injected into `misagent`, where it interposes `MGCopyAnswer` / `MGCopyAnswerWithError` and answers `UniqueDeviceID` from a config file — **all bases** | `/usr/libexec/misagent` (+ `/usr/lib/libmisfix.plist`) | **Let a provisioning profile written for a device you already own install on the guest.** `0xE8008012` (`misagent: attempt to install invalid profile`) is the ordinary refusal when the profile's `ProvisionedDevices` does not list this device — correct behaviour, and distinct from row 17's `0xE8008026`. It blocks the case the user actually wants: reusing a paid team's already-registered device rather than burning a registration slot on every VM. The UDID being compared comes from `MGCopyAnswer(kMGUniqueDeviceID)`, and three cheaper routes were ruled out by measurement before any hook was written. (1) **AMFI cannot supply it**: `security.codesigning.config` is a 4-byte flags word (read back as `0x000000CC`), not a string, so `amfi_emulate_device_udid` is dead on this board. (2) **No daemon can write it**: `/private/var/root/Library/Lockdown/data_ark.plist` carries no `UniqueDeviceID` — lockdown derives it each boot. (3) **The real source is out of reach**: TXM composes `UniqueDeviceID` from the device tree's `/chosen/chip-id`, `/chosen/unique-chip-id` and `/product/udid-version` *before the kernel runs*, and `chip-id` is fixed at `0x0000FE01` while `unique-chip-id` is the ECID the SHSH blob is bound to — changing it means the VM no longer restores. So `MGCopyAnswer` is necessarily where this is done. Fix: interpose it in `misagent` only, return a `+1` copy (matching `MGCopyAnswer`'s contract) of the configured string for `UniqueDeviceID`, and fall through untouched for every other property. Configuration is `/var/db/vphone/misfix.plist`, falling back to `/usr/lib/libmisfix.plist`, cached against mtime and size so editing the file takes effect on the next query with no restart — that is the "put it in the plist and it applies" entry point. The shipped plist is **empty**: with no `UniqueDeviceID` key the interpose returns NULL and the patch is inert, so it changes nothing until someone deliberately pastes a real device's UDID in. `installMISFixDefaults` writes the fallback plist **only when it is absent**, so re-running `cfw install` never clobbers a configured value. **Accepted inconsistency, agreed with the user rather than hidden:** only `misagent`'s profile matching sees the borrowed UDID. Xcode, lockdown and `devicectl` keep reporting the VM's own (`0000FE01-…`), because those come from a different process that is not hooked. The two therefore disagree, which is exactly what makes the profile match while the device stays identifiable as itself. Declared `system-misagent-cfw-device_identity` in `com.vphone.patchset.guest.system`; no `applicability`, not `bootEssential`, on in `standard` but inert without a configured UDID. **Partially validated (2026-09-30, `06-xcode-27`):** `cfw install` reports `[+] LC_LOAD_WEAK_DYLIB /usr/lib/libmisfix.dylib -> misagent` and `misagent` runs normally on the booted guest. Installing a real paid-team IPA against a borrowed UDID is **not** yet demonstrated, for the same host-side `devicectl` reason as row 18. See `VPhoneGuestComponents/MISFix/MISFixDeviceIdentity.c`, `MISFixConfig.c` and `Research/Guest/xcode_install_signature_gate.md`. |    Y    |  Y  |  Y  |
 
@@ -1554,3 +1554,394 @@ patches (issue #438), which `standard` now leaves off; see the note at the top.
 SystemHook no longer loads `libvlocation.dylib`, the bundle no longer ships it,
 and vphoned's `location.*` methods call IcliKit directly again. A guest that
 already has `/usr/lib/libvlocation.dylib` keeps the file, but nothing loads it.
+
+## `fw patch` re-patches the originals, not its own output (2026-09-30)
+
+No new Apple binary patch. This changes how every boot-chain patch in this
+document is applied, so it is recorded here.
+
+**The defect.** `FirmwarePipeline` patched each component in place: load the
+file, run the patchers, save over the same path. Run `fw patch` a second time on
+the same VM and the patchers were handed the first run's output, found none of
+the shapes they had already replaced, and the component failed —
+`Patch site not found: iBSS`, taking the whole run down at the second component.
+`fw prepare` refuses to re-extract over an existing restore tree
+("A restore tree already exists at …. Remove it, then prepare the firmware
+again."), so there was no recovery path either: a VM could be patched exactly
+once, for its whole life. Editing a VM's `PatchSelection.plist` to turn a patch
+off and re-running was therefore impossible, which is why the only way to test a
+preset change was to build a new machine, and why hand-editing the recorded
+`PatchPlan.plist` was being used to get around it.
+
+**Not the same defect as issue #532's second failure.** That one was a single
+patcher, `DyldSharedCacheMISTrustAuthPatcher`, not recognising its own post-patch
+shape on 27.0 — a DSC patcher, over a cache `cfw install` handles, fixed on
+2026-09-30 by teaching `locateSite` the `pacibsp ; mov x0,#0 ; retab` form (see
+row 17). This one is structural and sits above every boot-chain patcher: it
+would bite even if each patcher were perfectly self-recognising, because nothing
+kept the bytes they were meant to match against.
+
+**The fix.** `FirmwarePipelineOriginals.swift`. The first run copies each
+boot-chain file into `<vmDirectory>/FirmwareOriginals/`, mirroring its path
+under the VM bundle, before anything is written; every later run loads from that
+copy. `fw patch` is idempotent by construction — same VM, same plan, same bytes
+on disk however many times it runs — and the pristine container is also put back
+immediately before `loader.save`, because `ContainerFirmwareLoader.save`
+repackages the IM4P it finds at the destination and would otherwise wrap the
+second run's payload in the first run's container.
+
+The stash is a direct child of the VM directory and never of the restore tree,
+so `findRestoreDirectory` (which matches a directory *name* containing
+"Restore") and the component globs (rooted at the restore tree, or
+non-recursive in the VM root) cannot resolve a component to its own copy.
+
+**Turning a patch off now reverts it.** When the resolved plan selects nothing
+for a component — either every patch blocked, or the whole patch set dropped so
+no patcher is built at all — the unpatched image is copied back. A component
+nobody has ever patched is not rewritten, so its modification date stays where
+the restore left it.
+
+**Two components opt out** (`restorable: false`): `Filesystem`
+(`CryptexFilesystemPatcher`) and `Manifest` (`ManifestHashPatcher`). Both name
+`BuildManifest.plist`, but neither is a patcher over that one file — the first
+rewrites cryptex images across the restore tree, the second rewrites hashes that
+describe files other steps produced. Restoring the manifest alone would describe
+a tree that no longer exists. Both are `.less`-only, and `.less` is excluded from
+the mechanism outright so a `.less` run over a CFW-patched VM cannot read "this
+variant builds no boot-chain patchers" as "put the boot chain back".
+
+**Existing VMs.** A machine patched by an earlier build has no stash, so the
+first run under the new code would adopt its already-patched bytes as the
+"original". That case is detected rather than accepted: if the component then
+fails to patch, the copy is deleted — so it never becomes the baseline — and the
+error says the VM was patched by a build that kept no originals and that the
+restore tree must be removed and `fw prepare` re-run. Only `patchSiteNotFound` is
+rewritten this way; every other failure means what it says and passes through.
+
+Covered by `FirmwarePatcherTests/Pipeline/FirmwarePipelineOriginalsTests.swift`
+(7 tests), which drives `patchComponents` over a synthetic component whose
+patcher flips one byte and — like every real patcher — reports no site once that
+byte is flipped. The real boot chain needs firmware fixtures that are not in the
+repository. The same harness with `restorable: false` reproduces the old
+failure, so the test for the fix and the test for the defect differ only in the
+descriptor.
+
+## The MIS online-authorization patch leaves `standard` (2026-09-30)
+
+No new Apple binary patch. Row 17 (`mis_trust_auth`) is now **off by default**
+and renamed `dyld-cfw-mis_trust_auth` → **`dyld-exp-mis_trust_auth`**, which the
+naming rule requires: `effect` is `exp` for a patch `standard` leaves off.
+Renamed with it: `DyldSharedCacheMISTrustAuthPatcher.patchID` and the
+`on(...)` gate in `VPhoneCustomFirmwareInstaller`. The `cfw patch-mis-trust-auth`
+verb and the patcher itself are unchanged and still work when the patch is
+ticked on.
+
+**What forced it.** On a *pristine* 24A435 cache — `iPhone17,3_27.0_24A435` +
+cloudOS `26.4-23E5207q`, first `cfw install` on a fresh VM — the patcher cannot
+find its site at all:
+
+    Error: Patch site not found: checkTrustAndAuthorization: the prologue at
+    0x22406F814 neither seeds 0xE8008026 nor already reads
+    `pacibsp ; mov x0, #0 ; retab` — MIS has been rewritten
+
+and `cfw install` dies there, after the lockdown-mode patch and before
+everything that follows. The cache really was pristine: the same log shows a
+first-time `maxSlide 0x20000000 -> 0x0` and fresh writes from the lsd, libxpc
+and lockdown-mode patchers. So this is **not** the already-patched-anchor case
+fixed earlier the same day for 26.x — 24A435's `checkTrustAndAuthorization`
+genuinely matches neither shape `locateSite` accepts.
+
+**And the message was wrong.** MIS has *not* been rewritten. Measured on the
+pristine 24A435 SystemOS cryptex (`043-70113-702.dmg.aea`, decrypted with
+`fw aea-key` + `/usr/bin/aea` and mounted read-only; `cfw patch-mis-trust-auth
+--dry-run` against it reproduces the failure verbatim, same VMA):
+
+| | 26.6.2 | 24A435 |
+|---|---|---|
+| function | `0x1BC6AE364` | `0x22406F814` |
+| seed | `mov w21, #0x8026 ; movk w21, #0xe800, lsl #16` @ `+0x4C` | `mov w23, #0x8001 ; movk w23, #0xe800, lsl #16` @ `+0x34` |
+| reaches `0xE8008026` | seeded directly, **subtracts** down (`sub w21, w21, #0x2` → `…8024`) | **adds** up, `add w26, w23, #0x25` @ `+0x124` |
+| return register | `w21` (the seeded one) | `w26` (derived) |
+
+A whole-image decode of `libmis` (94,984 instructions, `0x224060000`–`0x2240BCC23`)
+finds **zero** mov-family instructions with immediate `0x8026` and **zero** raw
+`0xE8008026` words: on 24A435 the constant is never written literally at all.
+Everything else is as the patcher expects — the naming literal at `0x2240BCC23`
+occurs once, has exactly one adrp+add reference (`0x22406FB1C`) and that
+reference is inside the function; the nearest preceding `pacibsp` is the
+function start itself, and the instruction before it is an unconditional `b`.
+So the location routes were right and only `findSeededError` missed.
+
+`findSeededError` now accepts both, and the two are not interchangeable. The
+`0x8026` low half stands on its own. The `0x8001` low half is only the bottom of
+the MIS error range and proves nothing by itself, so it is accepted only when
+the same function also contains an `add w<result>, w<seed>, #imm` that
+arithmetically equals `0xE8008026`; the scan stops at the next function's
+`pacibsp`. That corroboration is not decoration: the function *preceding*
+`checkTrustAndAuthorization` on 24A435 carries the identical
+`mov w8, #0x8001 ; movk w8, #0xe800` idiom 18 instructions earlier, which is
+also why the seed window stays forward-only from the function start. Matching is
+on Capstone-decoded immediates and registers throughout, and nothing new is
+written, so no new encoder and no keystone trip.
+
+**A version gate went on the declaration with it.** `experimental` is
+`Kind = All`, so without one it would still turn this patch on for a 27 guest
+and produce an unbootable VM — and after the matcher fix it would now succeed in
+doing so. `applicability` is `iOSBase: .oneOf([.major(18), .major(26)])`. That
+is not a preference (a preference belongs in a preset's block list, and
+`standard` blocks it too) but the statement `applicability` exists for: applying
+it on 27 breaks the guest. An unreadable base satisfies only `.any`, so an
+unknown release skips the patch, which is the safe direction.
+
+**Why teaching the patcher the new shape is not, by itself, the answer.** Even
+when it applies, this patch stops an iOS 27 guest booting (issue #532:
+`TXM [Error]: Errno: selector: 45 | 78` → `dyld[1]: Library not loaded:
+/usr/lib/libSystem.B.dylib … (no such file, no dyld cache)` → `initproc failed
+to start`). Making it apply on 24A435 without also taking it out of `standard`
+would have converted a failed install into a guest that installs and then does
+not boot. Both were done, in that order.
+
+**VERIFIED (2026-09-30):** with the patch out of `standard`, `cfw install
+test-27.0` completes, and `iPhone17,3_27.0_24A435` + cloudOS `26.4-23E5207q`
+**boots clean** — `panicked: false`, vphoned answering 6s after launch,
+SpringBoard running (pid 36), `apps.list` returning 264 apps. **Issue #532 is
+closed**, and its cause is confirmed to have been this patch rather than
+anything else in the 27 install.
+
+**What replaced it.** `libmisfix.dylib` already reaches the same outcome from
+userspace, and by the better route — it steers the call rather than forging the
+return. `vpWidenedOptions` in `VPhoneGuestComponents/MISFix/MISFixSignature.c`
+sets `RespectUppTrustAndAuthorization = kCFBooleanFalse` in the options
+dictionary; libmis calls `checkTrustAndAuthorization` only when that flag is
+set, so `0xE8008026` is never produced, and because the ordinary success path
+still runs, the `info` dictionary (`CdHash`, `Entitlements`, `SignerType`,
+`TeamID`, `SigningID`, `ProfileUUID`) is filled for real. No cache page is
+written and nothing is re-attested, so there is nothing for TXM to reject.
+
+**The gap this leaves, stated plainly.** `cfw install` injects `libmisfix.dylib`
+into `installd` and `misagent` only, so the hook covers *installation*. An app
+signed with a **free personal-team** certificate is launched by SpringBoard,
+which asks MIS itself and is not hooked, so on a 26.x base that launch can still
+hit `0xE8008026` — a regression against the 2026-09-30 on-device validation of
+row 17 on 26.6.2. Ad-hoc / `ldid`-signed apps are unaffected either way: they
+carry no provisioning profile, so the online-authorization branch is not
+reached, and `AllowAdHocSigning` is what they need. Paid-team profiles were
+never affected. Closing the SpringBoard gap means injecting the same hook there,
+which cannot be done with a load command (SpringBoard's load-command padding at
+`0x548` is not free — inserting would overwrite 56 bytes of the first section)
+and so has to go through SystemHook's `posix_spawn` interposition.
+
+**Effect on the shipped presets.** `standard` adds `dyld-exp-mis_trust_auth` to
+its block list, mirrored in `FirmwarePatchSetCatalog.manualOnlyPatches` via the
+new `FirmwarePatchSetCatalog.misTrustAuthPatch`; `The shipped preset plists match
+the built-in copies` checks the two agree. `experimental` is `Kind = All` and so
+still turns it on, which is correct: that preset is documented as everything the
+bundle declares, including patches a 26.4 guest does not survive.
+
+## An interpose does not cross the shared cache (2026-09-30)
+
+**This supersedes the paragraph above that says the hook "covers
+*installation*".** It does not. `libmisfix.dylib` reaches misagent and nothing
+else that matters, and no version of it can reach installd, because
+`__DATA,__interpose` replaces **call sites** in the images dyld links and every
+call site on installd's path is inside the cache:
+
+```
+MobileInstallation.framework  →  libmis.dylib        (cache to cache)
+libmis.dylib                  →  libMobileGestalt    (cache to cache)
+```
+
+Measured on test-26.4, `libmisfix[726]`, with `LogQueries` on, the query log
+carrying each caller's image (`MISFixCallerImage`, `dladdr` on the return
+address) and the validation log made unconditional. One
+`devicectl device install app` of a paid-team-signed AirBuild.app produced
+exactly one line from installd:
+
+```
+libmisfix[726]: MGCopyAnswer(BuildVersion) from installd passed through
+```
+
+`from installd` is the finding: the only call the hook catches is the one the
+**main executable** makes itself. misagent works for that reason and no other —
+its own binary calls `MGCopyAnswer`, three times per install, each answered
+`-> override`.
+
+What installd did instead, in the same capture:
+
+```
+amfi_interface_query_bootarg_state returned error Function not implemented
+cdhash: <private> is trusted
+Trust evaluate failure: [leaf IssuerCommonName LeafMarkerOid SubjectCommonName]
+Skipping a profile because of error 0xe8008012.
++[MICodeSigningVerifier _validateSignatureAndCopyInfoForURL:withOptions:error:]:
+    80: Failed to verify code signature of …/AirBuild.app : 0xe8008015
+```
+
+Three things follow, and each corrects something previously written here:
+
+1. **The signature was never the problem.** `cdhash … is trusted`. The failure
+   is the profile: libmis walked the installed profiles and skipped every one
+   with `0xE8008012` — this device is not in `ProvisionedDevices` — leaving
+   `0xE8008015`, "a valid provisioning profile for this executable was not
+   found".
+2. **libmis resolved a UDID without going through the interpose.** No
+   `MGCopyAnswer(UniqueDeviceID)` line exists from installd, yet the comparison
+   plainly happened. Its other route is closed —
+   `amfi_interface_query_bootarg_state` returns `ENOSYS`, so the
+   `amfi_emulate_device_udid` path libmis prefers is dead on this guest and the
+   MobileGestalt fallback is what ran.
+3. **`AllowAdHocSigning` has never taken effect in installd.** No
+   `MISValidateSignatureAndCopyInfo` line appears either, from a log that no
+   longer returns early on an unconvertible path argument. `MICodeSigningVerifier`
+   lives in MobileInstallation, not in installd, so that call is cache-to-cache
+   too. The measured table at the top of `MISFixSignature.c` was taken by
+   calling libmis directly; it is still true of libmis and was never reached
+   through installd.
+
+`DYLD_INSERT_LIBRARIES` does not change this. Commit `d44a0e9` had already
+moved libmisfix from a `LC_LOAD_WEAK_DYLIB` of installd to SystemHook's insert
+list, which is the strongest position an interpose can hold, and the capture
+above is from that arrangement.
+
+**What can still work.** Three routes, in the order they were judged:
+
+- **Rewrite the callee, not the call sites.** A detour at the top of
+  `MGCopyAnswer` and `MISValidateSignatureAndCopyInfo` is reached by every
+  caller, cache-internal or not. It stays a guest dylib, so
+  `cfw update-environment` deploys it to an existing VM and no cache page is
+  written — nothing for TXM to reject, which is what makes it preferable to a
+  new libmis patch after #532. It needs the process to make a cache text page
+  writable (copy-on-write) and to obtain executable memory for the trampoline;
+  `MISFixCacheWriteProbe.c` measures both behind `ProbeCacheWrite`, in installd
+  only.
+- **A shared-cache patch on libmis**, forcing the `ProvisionedDevices` check to
+  pass and the ad-hoc option on. Same family as row 17, so the same risk: row 17
+  is the patch that stopped a 27.0 guest booting.
+- **Give the VM the right UDID instead of lying about it.** A modern UDID is
+  `<chip-id>-<ECID>`; `chip-id` is fixed at `0x0000FE01` by the virtual SoC but
+  the ECID is chosen at `vm create`, and the SHSH blob is personalised against
+  it either way. A VM created with the ECID of a device the team has already
+  registered needs no hook at all. It does not help an ad-hoc IPA, which has no
+  profile to match.
+
+**A mistake in the first probe, recorded because it is easy to repeat.** dyld
+applies interposing to `dlsym` as well as to call sites, so
+`dlsym(RTLD_DEFAULT, "MGCopyAnswer")` returns *libmisfix's own replacement* —
+the probe measured its own text and never touched the cache. It then asked for
+`VM_PROT_WRITE` in place of `VM_PROT_EXECUTE` on the page it was executing
+from, which faults on the next instruction fetch and crash-looped installd
+until the flag was cleared.
+
+A handle-scoped `dlsym` is interposed too — measured, on a handle to
+libMobileGestalt itself — so there is no spelling of `dlsym` that answers this.
+What dyld leaves alone is the interposing image's own imports, which is why
+`MISFixDetour` takes an address that libmisfix obtained with `&`, and refuses
+to take a name at all.
+
+## An Xcode install works, and what it took (2026-09-30)
+
+Measured on test-26.4, `xcrun devicectl device install app` with
+`AirBuild-Debug.ipa` — a paid team's app (`QDJ93ZUQ9B`), signed
+`Apple Development`, whose embedded profile provisions eight real devices and
+no VM:
+
+```
+App installed:
+• bundleID: plus.yellow.AirBuild
+• installationURL: file:///private/var/containers/Bundle/Application/9A626C1C-…/AirBuild.app/
+```
+
+and it launches. So does a `codesign --sign -` bundle with no certificate and
+no profile at all. Four separate refusals had to go, in this order, and each
+one was only visible once the one before it was gone.
+
+1. **The interpose never ran.** Replaced by `MISFixDetour`: a four-word
+   absolute jump at the top of the callee, the displaced instructions
+   relocated onto an `mmap`ed trampoline, the target page taken
+   copy-on-write. Installed in installd's own address space, so nothing on
+   disk and no other process changes — which is the whole difference between
+   this and row 17, the libmis cache patch that stopped a 27.0 guest booting.
+   Measured: `detour: MISValidateSignatureAndCopyInfoWithProgress at
+   0x1bf41c830 in libmis.dylib`.
+
+   `MISValidateSignatureAndCopyInfo` itself is a thunk in front of the
+   `…WithProgress` body, shorter than the jump, and `MISFixDetour` refuses it
+   with `MISFixDetourTooShort` rather than write over whatever follows. Its
+   callers are covered anyway, because it branches into the hooked function.
+
+2. **`0xE8008015`, no valid profile.** Widening the options does not help a
+   CMS-signed app: `AllowAdHocSigning` is about ad-hoc signatures, and this one
+   is real. The profile has to actually install, and misagent refuses it
+   because a VM's UDID is in no `ProvisionedDevices`. misagent asks
+   `MISProfileGetValue(profile, "ProvisionsAllDevices")` *first* and only
+   consults the device list when that is false — so `MISFixProfileScope.c`
+   detours `MISProfileGetValue` and answers that one key `true`. The profile
+   then installs for real and MIS validates the app against it:
+
+   ```
+   misagent: Installing provisioning profile: 50806e9b-…
+   MISValidateSignature(…/extracted/Payload/AirBuild.app) -> 0x0
+     info[SigningID] = plus.yellow.AirBuild   info[TeamID] = QDJ93ZUQ9B
+     info[SignerCertificate] = <1484 bytes>   info[Entitlements] = <7 entries>
+     info[ValidatedByProfile] = true          info[SignerType] = 3
+   ```
+
+   Nothing is faked: the signature, the certificate, the entitlements and the
+   cdhash are the ones Apple issued. The only claim widened is which devices
+   the profile covers.
+
+3. **`0xE8008012` from `-[MIInstallableBundle _installEmbeddedProfilesWithError:]`.**
+   Kept as a backstop for a profile that still cannot install, in
+   `MISFixInstallPolicy.c`: the real implementation runs, and a refusal is
+   logged and turned into "there is no profile" rather than a failed install.
+
+4. **`-[MICodeSigningVerifier performValidationWithError:]`, line 424, "Failed
+   to extract signer identity".** The gate behind the gate, and the one that
+   stops an ad-hoc signature: MIS accepts the bundle and MobileInstallation
+   then wants a CMS leaf certificate out of it, which `codesign --sign -`
+   does not produce.
+
+   The verifier already knows what to do. It carries `allowAdhocSigning` as a
+   settable property — the same shape as the MIS option — and installd never
+   turns it on, so `MISFixInstallPolicy.c` forces the getter. The real
+   validation then succeeds and fills `signingInfo` for real.
+
+Both Objective-C hooks are swizzles, not detours. A method list is data, so
+replacing an implementation reaches every caller without making any cache text
+writable; where that is available it is strictly better.
+
+### The dead end that proved the shape of the fix
+
+Before `allowAdhocSigning` was found, `performValidationWithError:` was forced
+to return `YES` after it had failed. That got no further:
+
+```
+-[MIExecutableBundle codeSigningInfoByValidatingResources:…]: 1306:
+    Code signing identifier ((null)) does not match bundle identifier (wiki.qaq.vphone.signtest)
+```
+
+The verifier had bailed before storing anything, so its caller read a nil
+signing identifier. A refusal can be allowed through; an answer that was never
+computed cannot be invented. The override was removed once the property made
+it unnecessary, and the rule generalises to every gate above MIS.
+
+The class's interface came from the runtime, not from a disassembly:
+`class_copyMethodList` and `class_copyIvarList` printed into the note log.
+`MISFixInstallPolicy.c` still does that, but only when a selector it expects
+has gone, which is the one moment the list earns its few hundred lines.
+
+### Still refused, deliberately
+
+A bundle with no signature at all (`0xE800801C`) and an app with no
+`application-identifier` entitlement (`MIInstallerErrorDomain` 63). Both are
+real absences rather than policy, and everything downstream needs what they
+are missing. Unsigned bundles reach the guest through vphoned's
+`apps.install`, which re-signs in the container and never involves installd.
+
+### A trap in the measurement, not in the guest
+
+Two runs failed with `0xE8008017` on a bundle whose signature was fine. The
+IPA had been repacked on the host with `zip -r`, which writes AppleDouble
+`._*` files next to every resource; they break the sealed resource envelope.
+`COPYFILE_DISABLE=1 zip -X` after deleting them, and the same bundle installs.
+Worth remembering before reading `0xE8008017` as a guest-side gate.
