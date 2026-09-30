@@ -231,6 +231,43 @@ reasons: it keeps vmnet and Internet Sharing in the picture, so the host-side
 impact above stays; and acting on pf needs root, the same objection as E — with
 none of E's reduction in code.
 
+## The privilege E would actually need
+
+It is tempting to assume E can copy how `nat` gets its privilege — `vphone-vm`
+carries `com.apple.vm.networking`, so vmnet's shared mode works with no root.
+That does **not** transfer. `com.apple.vm.networking` is a virtualization-specific
+door Apple opened for vmnet's shared/host modes; a utun is a different kernel
+object behind a different check.
+
+Measured, from a small C probe (`socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL)`
+→ `ioctl(CTLIOCGINFO)` → `connect(sockaddr_ctl)`):
+
+```
+ctl_id=5
+connect: Operation not permitted     <-- EPERM
+```
+
+The kernel control is reachable, but `connect` — the call that would create the
+interface — is refused. Which matches how the only two VPN clients on this
+machine do it:
+
+```
+root      Cloudflare WARP   …/Resources/CloudflareWARP          (root daemon)
+granger   Tailscale         …/PlugIns/IPNExtension.appex/…      (NetworkExtension)
+```
+
+Those are the only two routes on macOS: **root**, or **NetworkExtension** (a
+system extension the user installs and authorises). There is no third.
+
+For E that means the utun must be created by either a root helper — which
+`vphone-cli`'s contract explicitly rules out, and which Launchpad's helper
+deliberately has no verb for — or a NetworkExtension, which is a different
+deliverable entirely, not a `vphone-cli` mode.
+
+This is the asymmetry that decides between A and E: **A is the only candidate
+that needs no privilege at all**, because it never asks the kernel for an
+interface. It just reads and writes frames over a socketpair it owns.
+
 ## Validation
 
 Same shape as the v1.x work, but without the helper: drive the transport the
