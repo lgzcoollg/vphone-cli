@@ -157,6 +157,42 @@ struct VPhoneDHCPMessage {
 
 // MARK: - Responder
 
+/// One guest UDP flow, identified by both ends so a reply can be addressed back
+/// without keeping a mapping the other way round.
+struct VPhoneUDPFlow: Hashable {
+    let sourceAddress: VPhoneIPv4Address
+    let sourcePort: UInt16
+    let destinationAddress: VPhoneIPv4Address
+    let destinationPort: UInt16
+    /// The guest's MAC, learned from the frame. Carried here so the forwarder can
+    /// build a reply without reaching back into the responder.
+    let guestHardware: VPhoneMACAddress
+
+    /// Identity as the forwarder keys sessions: one host socket per flow, reused
+    /// while both ends stay the same.
+    var key: VPhoneUDPFlowKey {
+        VPhoneUDPFlowKey(sourceAddress: sourceAddress, sourcePort: sourcePort, destinationAddress: destinationAddress, destinationPort: destinationPort)
+    }
+}
+
+struct VPhoneUDPFlowKey: Hashable {
+    let sourceAddress: VPhoneIPv4Address
+    let sourcePort: UInt16
+    let destinationAddress: VPhoneIPv4Address
+    let destinationPort: UInt16
+}
+
+/// What a frame from the guest asks for.
+enum VPhoneUserspaceNetworkOutcome {
+    /// Send this frame straight back.
+    case reply([UInt8])
+    /// The frame is a UDP payload for somewhere beyond the guest; the forwarder
+    /// owns the answer, which arrives later.
+    case forward(flow: VPhoneUDPFlow, payload: [UInt8])
+    /// Nothing to say.
+    case drop
+}
+
 /// Turns a frame from the guest into at most one frame back.
 ///
 /// Everything here is deliberately pure apart from `guestMAC`, which is learned
@@ -174,20 +210,20 @@ final class VPhoneUserspaceNetworkResponder {
 
     var netmask: VPhoneIPv4Address { VPhoneIPv4Address(255, 255, 255, 0) }
 
-    func respond(to frame: [UInt8]) -> [UInt8]? {
-        guard let ethernet = VPhoneEthernetFrame(bytes: frame) else { return nil }
+    func handle(_ frame: [UInt8]) -> VPhoneUserspaceNetworkOutcome {
+        guard let ethernet = VPhoneEthernetFrame(bytes: frame) else { return .drop }
         // Learn (or refresh) the guest's address from anything it sends.
         if ethernet.source != VPhoneMACAddress.gateway {
             guestMAC = ethernet.source
         }
-        guard let etherType = VPhoneEtherType(rawValue: ethernet.etherType) else { return nil }
+        guard let etherType = VPhoneEtherType(rawValue: ethernet.etherType) else { return .drop }
 
         switch etherType {
         case .arp:
-            guard let message = VPhoneARPMessage(bytes: ethernet.payload) else { return nil }
-            return respondToARP(message)
+            guard let message = VPhoneARPMessage(bytes: ethernet.payload) else { return .drop }
+            return respondToARP(message).map { .reply($0) } ?? .drop
         case .ipv4:
-            guard let packet = VPhoneIPv4Packet(bytes: ethernet.payload) else { return nil }
+            guard let packet = VPhoneIPv4Packet(bytes: ethernet.payload) else { return .drop }
             return respondToIPv4(packet)
         }
     }
@@ -218,11 +254,11 @@ final class VPhoneUserspaceNetworkResponder {
 
     // MARK: - IPv4
 
-    private func respondToIPv4(_ packet: VPhoneIPv4Packet) -> [UInt8]? {
-        guard let proto = VPhoneIPProtocol(rawValue: packet.proto) else { return nil }
+    private func respondToIPv4(_ packet: VPhoneIPv4Packet) -> VPhoneUserspaceNetworkOutcome {
+        guard let proto = VPhoneIPProtocol(rawValue: packet.proto) else { return .drop }
         switch proto {
         case .icmp:
-            return respondToICMP(packet)
+            return respondToICMP(packet).map { .reply($0) } ?? .drop
         case .udp:
             return respondToUDP(packet)
         }
@@ -253,9 +289,31 @@ final class VPhoneUserspaceNetworkResponder {
         return encapsulate(reply.bytes, destinationMAC: guestMAC ?? broadcastMAC)
     }
 
-    private func respondToUDP(_ packet: VPhoneIPv4Packet) -> [UInt8]? {
-        guard let datagram = VPhoneUDPDatagram(bytes: packet.payload),
-              datagram.destinationPort == VPhoneDHCPMessage.serverPort,
+    private func respondToUDP(_ packet: VPhoneIPv4Packet) -> VPhoneUserspaceNetworkOutcome {
+        guard let datagram = VPhoneUDPDatagram(bytes: packet.payload) else { return .drop }
+
+        // DHCP is the one UDP exchange this side finishes itself: the guest is
+        // asking us, by definition.
+        if let reply = respondToDHCP(packet, datagram) { return .reply(reply) }
+
+        // Everything else is egress. The answer has to reach the guest, so we
+        // need its MAC — and until it has sent something we do not have it.
+        guard let guestMAC, packet.source != .any else { return .drop }
+        return .forward(
+            flow: VPhoneUDPFlow(
+                sourceAddress: packet.source,
+                sourcePort: datagram.sourcePort,
+                destinationAddress: packet.destination,
+                destinationPort: datagram.destinationPort,
+                guestHardware: guestMAC,
+            ),
+            payload: datagram.payload,
+        )
+    }
+
+    /// Our own DHCP server, or nil when this is not a request we answer.
+    private func respondToDHCP(_ packet: VPhoneIPv4Packet, _ datagram: VPhoneUDPDatagram) -> [UInt8]? {
+        guard datagram.destinationPort == VPhoneDHCPMessage.serverPort,
               let request = VPhoneDHCPMessage(bytes: datagram.payload)
         else { return nil }
 
@@ -284,14 +342,14 @@ final class VPhoneUserspaceNetworkResponder {
         // The guest has no address yet, so a DHCP reply is always broadcast at
         // the IP layer. That is what the BOOTP broadcast flag is for, and every
         // client accepts it.
-        let packet = VPhoneIPv4Packet(
+        let wrapped = VPhoneIPv4Packet(
             source: configuration.hostAddress,
             destination: .broadcast,
             proto: .udp,
             ttl: 16,
             payload: replyDatagram.bytes(source: configuration.hostAddress, destination: .broadcast),
         )
-        return encapsulate(packet.bytes, destinationMAC: broadcastMAC)
+        return encapsulate(wrapped.bytes, destinationMAC: broadcastMAC)
     }
 
     // MARK: - Framing

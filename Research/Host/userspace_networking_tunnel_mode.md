@@ -78,17 +78,59 @@ Two bugs were found this way rather than in a VM: a duplicate `datagram`
 binding in the DHCP path (a compile error), and a test that fed the payload into
 the IPv4 header checksum (the checksum covers the header only).
 
-## What stage 1 does *not* do
+## Stage 2: UDP and DNS
 
-`tunnel` currently reaches the gateway and nothing else. The guest will get a
-lease, resolve the gateway's MAC, and ping `192.168.127.1`, but every packet
-destined beyond it is dropped:
+The guest's UDP now leaves through the host and comes back.
+
+| file | role |
+| --- | --- |
+| `Network/VPhoneUDPForwarder.swift` | one connected `SOCK_DGRAM` socket per flow, plus the host resolver lookup |
+
+The design turns on two things:
+
+- **A connected UDP socket per flow.** `connect()` on a `SOCK_DGRAM` socket makes
+  the kernel demultiplex for us: a datagram can only arrive from the address we
+  sent to, so an unrelated sender cannot reach the guest. That is the whole
+  security story for an unprivileged forwarder, and it is why the sockets are
+  connected rather than bound.
+- **The reply is addressed as if it came from where the guest sent it.** A DNS
+  lookup is addressed to `192.168.127.1`, so the answer has to appear to come
+  from there or the guest's stack discards it. `sendUDPReply` uses the flow's
+  *destination* as the reply's source for exactly this reason.
+
+DNS specifically: the guest is told its resolver is the gateway, so lookups
+arrive addressed to us. `resolveDestination` sends those to the host's own
+resolver, read through `SystemConfiguration` rather than a file — that is what
+changes when a VPN connects, and the point of the mode is that the guest follows
+the host. Everything else is forwarded to the address the guest named.
+
+Flows are forgotten after 30 seconds without traffic, which is the only thing
+bounding the session table since UDP has no teardown.
+
+### Verified
+
+19 checks, all passing, from a driver compiled over the same Foundation-only
+files: the outcome classes (ARP/ICMP still plain replies, DHCP still finished
+locally, UDP for elsewhere becoming a forward carrying both ends and the guest's
+MAC, a `0.0.0.0` source refused), and a **real round trip** against a local UDP
+echo server — payload returned intact, the same flow reusing its one socket, a
+second destination opening a second session, and `stop()` clearing them.
+
+That round trip earned its keep: it found a real bug. `sin_addr` was left in
+host order while `sin_port` was converted, which asks for an entirely different
+address and fails with `EADDRNOTAVAIL`. Nothing in a VM would have said so
+clearly.
+
+## What is not done yet
+
+Stage 3 (TCP) is the real egress and the point of the mode; until then the guest
+can resolve names but not fetch anything.
 
 | | stage |
 | --- | --- |
-| ARP, DHCP, ICMP to gateway | **1 (this)** |
-| UDP + DNS | 2 |
+| ARP, DHCP, ICMP to gateway | 1 (done) |
+| UDP + DNS | 2 (done) |
 | TCP (the real egress) | 3 |
 
-That is expected, not a misconfiguration. The mode is not usable for real
-traffic until stage 3, which is also where the VPN payoff appears.
+That is expected, not a misconfiguration: the mode is not usable for real traffic
+until stage 3, which is also where the VPN payoff appears.

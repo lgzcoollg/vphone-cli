@@ -274,4 +274,70 @@ struct VPhoneUserspaceNetworkTests {
         let ethernet = try #require(VPhoneEthernetFrame(bytes: reply))
         #expect(ethernet.destination.bytes == guestMAC.bytes)
     }
+
+    // MARK: - UDP forwarding
+
+    /// UDP that is not DHCP is egress rather than something this side answers.
+    /// The flow it names has to carry both ends and the guest's MAC, because the
+    /// answer is built later, by the forwarder, with no access to this type.
+    @Test func `UDP for somewhere else becomes a forward`() throws {
+        let responder = responder()
+        // Learn the MAC first, the way a real guest's traffic would.
+        _ = responder.handle(arpFrame(targeting: configuration.hostAddress))
+
+        let query = VPhoneUDPDatagram(sourcePort: 51000, destinationPort: 53, payload: [0xAB, 0xCD, 0x01, 0x00])
+        let frame = ipv4Frame(
+            source: configuration.guestAddress,
+            destination: configuration.hostAddress,
+            proto: .udp,
+            payload: query.bytes(source: configuration.guestAddress, destination: configuration.hostAddress),
+            destinationMAC: .gateway,
+        )
+
+        guard case let .forward(flow, payload) = responder.handle(frame) else {
+            Issue.record("expected a forward")
+            return
+        }
+        #expect(flow.sourceAddress == configuration.guestAddress)
+        #expect(flow.sourcePort == 51000)
+        #expect(flow.destinationAddress == configuration.hostAddress)
+        #expect(flow.destinationPort == 53)
+        #expect(flow.guestHardware.bytes == guestMAC.bytes)
+        #expect(payload == [0xAB, 0xCD, 0x01, 0x00])
+    }
+
+    /// Without a learned MAC there is nowhere to send the answer, so no forward
+    /// may be produced.
+    @Test func `UDP is dropped before the guest MAC is known`() {
+        let query = VPhoneUDPDatagram(sourcePort: 51000, destinationPort: 53, payload: [0x00])
+        let frame = ipv4Frame(
+            source: configuration.guestAddress,
+            destination: configuration.hostAddress,
+            proto: .udp,
+            payload: query.bytes(source: configuration.guestAddress, destination: configuration.hostAddress),
+            destinationMAC: .gateway,
+        )
+        if case .forward = responder().handle(frame) {
+            Issue.record("a forward was produced without a guest MAC")
+        }
+    }
+
+    /// DHCP stays local: it is the one UDP exchange this side finishes itself.
+    @Test func `DHCP is answered locally, not forwarded`() {
+        if case .forward = responder().handle(dhcpFrame(type: .discover)) {
+            Issue.record("DHCP should not be forwarded")
+        }
+    }
+}
+
+// MARK: - Test shims
+
+private extension VPhoneUserspaceNetworkResponder {
+    /// The frame this responder would send back, or nil when it would send none.
+    /// Added when `respond(to:)` became `handle(_:)` returning an outcome, so
+    /// the frame-level tests above kept reading the same way.
+    func respond(to frame: [UInt8]) -> [UInt8]? {
+        if case let .reply(reply) = handle(frame) { return reply }
+        return nil
+    }
 }

@@ -60,7 +60,7 @@ public struct VPhoneUserspaceNetworkConfiguration: Sendable, Equatable {
 /// A 48-bit Ethernet address. The host side uses a locally administered address
 /// of its own; the guest's is learned from the first frame it sends, because
 /// Virtualization.framework assigns the MAC and never tells us what it picked.
-public struct VPhoneMACAddress: Sendable, Equatable {
+public struct VPhoneMACAddress: Sendable, Equatable, Hashable {
     public var bytes: [UInt8]
 
     public init(_ bytes: [UInt8]) { self.bytes = bytes }

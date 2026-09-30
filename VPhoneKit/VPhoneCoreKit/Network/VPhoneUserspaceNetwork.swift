@@ -47,12 +47,15 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     private let socket: Int32
     /// Held so the attachment (and therefore the VZ device tree) outlives us.
     private let attachment: VZFileHandleNetworkDeviceAttachment
-    private let queue = DispatchQueue(label: "com.vphone.userspace-network")
+    private let queue: DispatchQueue
     private var source: DispatchSourceRead?
     /// Set by `stop()`. Cancelling the read source closes our descriptor once no
     /// handler is running, so the pair cannot be reopened after that.
     private var isStopped = false
     private var responder: VPhoneUserspaceNetworkResponder
+    /// Carries the guest's UDP out to the host and the answers back. Owns one
+    /// socket per flow, so it is the thing `stop()` has to tear down.
+    private let forwarder: VPhoneUDPForwarder
 
     /// Largest frame we will accept from the guest. Ethernet header plus a
     /// jumbo-sized IP packet; the guest is expected to stay within `mtu`.
@@ -73,12 +76,19 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
         }
 
         let guestEnd = descriptors[0]
-        socket = descriptors[1]
+        let hostEnd = descriptors[1]
+        socket = hostEnd
         attachment = VZFileHandleNetworkDeviceAttachment(
             fileHandle: FileHandle(fileDescriptor: guestEnd, closeOnDealloc: true),
         )
+        queue = DispatchQueue(label: "com.vphone.userspace-network")
         responder = VPhoneUserspaceNetworkResponder(configuration: configuration)
         self.configuration = configuration
+        // A reply from the forwarder is wrapped without consulting the responder
+        // again: the flow already carries both ends and the guest's MAC.
+        forwarder = VPhoneUDPForwarder(configuration: configuration, queue: queue) { [weak self] flow, payload in
+            self?.sendUDPReply(flow: flow, payload: payload)
+        }
     }
 
     /// The object to hand to `VZVirtioNetworkDeviceConfiguration.attachment`.
@@ -96,17 +106,19 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             source.setCancelHandler { close(descriptor) }
             source.resume()
             self.source = source
+            forwarder.start()
         }
     }
 
     /// Stop draining and close our end. Idempotent. There is no way back: the
-    /// descriptor is gone, so a later `start()` does nothing.
+    /// descriptors are gone, so a later `start()` does nothing.
     public func stop() {
         queue.sync {
             guard !isStopped else { return }
             isStopped = true
             source?.cancel()
             source = nil
+            forwarder.stop()
         }
     }
 
@@ -126,10 +138,47 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             }
             if received <= 0 { return } // EAGAIN once the queue is empty
             let frame = Array(buffer[0 ..< received])
-            guard let reply = responder.respond(to: frame) else { continue }
-            reply.withUnsafeBytes { raw in
-                _ = send(socket, raw.baseAddress, raw.count, 0)
+            switch responder.handle(frame) {
+            case .drop:
+                continue
+            case let .reply(reply):
+                write(reply)
+            case let .forward(flow, payload):
+                // The answer arrives later, on this same queue.
+                forwarder.send(payload, for: flow)
             }
         }
+    }
+
+    /// Hand a finished frame to the guest's side of the pair.
+    private func write(_ frame: [UInt8]) {
+        frame.withUnsafeBytes { raw in
+            _ = send(socket, raw.baseAddress, raw.count, 0)
+        }
+    }
+
+    /// Wrap one forwarded datagram as if it came from where the guest sent it.
+    ///
+    /// The source address is the guest's *destination*, not our gateway address:
+    /// a DNS lookup was addressed to `192.168.127.1`, so the answer has to
+    /// appear to come from there or the guest's stack will discard it.
+    private func sendUDPReply(flow: VPhoneUDPFlow, payload: [UInt8]) {
+        let datagram = VPhoneUDPDatagram(
+            sourcePort: flow.destinationPort,
+            destinationPort: flow.sourcePort,
+            payload: payload,
+        )
+        let packet = VPhoneIPv4Packet(
+            source: flow.destinationAddress,
+            destination: flow.sourceAddress,
+            proto: .udp,
+            payload: datagram.bytes(source: flow.destinationAddress, destination: flow.sourceAddress),
+        )
+        write(VPhoneEthernetFrame(
+            destination: flow.guestHardware,
+            source: .gateway,
+            etherType: .ipv4,
+            payload: packet.bytes,
+        ).bytes)
     }
 }
