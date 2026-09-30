@@ -52,7 +52,24 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     private static let log = Logger(subsystem: "com.vphone.tunnel", category: "frames")
     /// Reused across frames; see the note on the UDP forwarder's buffer.
     private var frameBuffer = [UInt8](repeating: 0, count: VPhoneUserspaceNetwork.frameCapacity)
+    /// Totals for the current one-second interval.
+    ///
+    /// Per-packet logging is too expensive to leave on at video rates, and with
+    /// nothing at all a stalled flow looks exactly like an idle one. One line a
+    /// second costs nothing and answers "is anything moving, and in which
+    /// direction".
+    private var traffic = TrafficCounters()
+    private var trafficTimer: DispatchSourceTimer?
     private var source: DispatchSourceRead?
+
+    private struct TrafficCounters {
+        var framesFromGuest = 0
+        var bytesFromGuest = 0
+        var framesToGuest = 0
+        var bytesToGuest = 0
+        var udpReplies = 0
+        var tcpSegments = 0
+    }
     /// Set by `stop()`. Cancelling the read source closes our descriptor once no
     /// handler is running, so the pair cannot be reopened after that.
     private var isStopped = false
@@ -126,6 +143,12 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             self.source = source
             forwarder.start()
             tcpForwarder.start()
+
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + 1, repeating: 1)
+            timer.setEventHandler { [weak self] in self?.reportTraffic() }
+            timer.resume()
+            trafficTimer = timer
             Self.log.info(
                 "tunnel up: gateway \(String(describing: self.configuration.hostAddress), privacy: .public) guest \(String(describing: self.configuration.guestAddress), privacy: .public) mtu \(self.configuration.mtu, privacy: .public) resolver \(VPhoneHostResolver.preferred()?.description ?? "NONE", privacy: .public)",
             )
@@ -140,6 +163,8 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             isStopped = true
             source?.cancel()
             source = nil
+            trafficTimer?.cancel()
+            trafficTimer = nil
             forwarder.stop()
             tcpForwarder.stop()
         }
@@ -159,6 +184,8 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
                 recv(socket, raw.baseAddress, raw.count, 0)
             }
             if received <= 0 { return } // EAGAIN once the queue is empty
+            traffic.framesFromGuest += 1
+            traffic.bytesFromGuest += received
             let frame = Array(frameBuffer[0 ..< received])
             if let ethernet = VPhoneEthernetFrame(bytes: frame) {
                 let kind = VPhoneEtherType(rawValue: ethernet.etherType)
@@ -213,17 +240,22 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             proto: .tcp,
             payload: segment.bytes(source: flow.destinationAddress, destination: flow.sourceAddress),
         )
-        // UDP has the same ceiling TCP does but nothing above to chop it up, and
-        // a QUIC reply is right at the boundary. Fragment rather than hand the
-        // guest something it cannot take.
+        // Segments are already cut to the guest's MSS, so these normally fit in
+        // one. The call stays because a guest is free to advertise an MSS larger
+        // than the MTU we sent it, and silently emitting an oversized datagram
+        // would be the same bug as above.
         for fragment in packet.fragmented(toFit: configuration.mtu) {
-            write(VPhoneEthernetFrame(
+            let frame = VPhoneEthernetFrame(
                 destination: flow.guestHardware,
                 source: .gateway,
                 etherType: .ipv4,
                 payload: fragment,
-            ).bytes)
+            ).bytes
+            traffic.framesToGuest += 1
+            traffic.bytesToGuest += frame.count
+            write(frame)
         }
+        traffic.tcpSegments += 1
     }
 
     private func sendUDPReply(flow: VPhoneUDPFlow, payload: [UInt8]) {
@@ -238,11 +270,30 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             proto: .udp,
             payload: datagram.bytes(source: flow.destinationAddress, destination: flow.sourceAddress),
         )
-        write(VPhoneEthernetFrame(
-            destination: flow.guestHardware,
-            source: .gateway,
-            etherType: .ipv4,
-            payload: packet.bytes,
-        ).bytes)
+        // UDP has no layer above it to chop anything up, and QUIC rides right at
+        // the MTU boundary, so a reply that does not fit has to be fragmented
+        // here or it goes out as a datagram the guest cannot take.
+        for fragment in packet.fragmented(toFit: configuration.mtu) {
+            let frame = VPhoneEthernetFrame(
+                destination: flow.guestHardware,
+                source: .gateway,
+                etherType: .ipv4,
+                payload: fragment,
+            ).bytes
+            traffic.framesToGuest += 1
+            traffic.bytesToGuest += frame.count
+            write(frame)
+        }
+        traffic.udpReplies += 1
+    }
+
+    /// One line a second, and only when something moved.
+    private func reportTraffic() {
+        let counts = traffic
+        traffic = TrafficCounters()
+        guard counts.framesFromGuest > 0 || counts.framesToGuest > 0 else { return }
+        Self.log.info(
+            "1s  guest-> \(counts.framesFromGuest, privacy: .public) frames \(counts.bytesFromGuest, privacy: .public)B  |  ->guest \(counts.framesToGuest, privacy: .public) frames \(counts.bytesToGuest, privacy: .public)B  (udp \(counts.udpReplies, privacy: .public) replies, tcp \(counts.tcpSegments, privacy: .public) segments)",
+        )
     }
 }

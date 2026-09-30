@@ -144,9 +144,15 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
         guard let session = session(for: flow) else { return }
         session.lastActivity = Date()
         Self.log.debug("udp out \(payload.count, privacy: .public)B -> \(String(describing: session.destination.address), privacy: .public):\(session.destination.port, privacy: .public)")
-        payload.withUnsafeBytes { raw in
+        let sent = payload.withUnsafeBytes { raw in
             // Qualified: the type has its own `send` for guest payloads.
-            _ = Darwin.send(session.socket, raw.baseAddress, raw.count, 0)
+            Darwin.send(session.socket, raw.baseAddress, raw.count, 0)
+        }
+        if sent != payload.count {
+            // EAGAIN (the host's buffer is full) or EMSGSIZE (the datagram is
+            // larger than this socket will carry). Either way the datagram is
+            // gone, and a silent drop here looks like the network misbehaving.
+            Self.log.error("udp to host failed: \(sent, privacy: .public)/\(payload.count, privacy: .public)B errno \(errno, privacy: .public)")
         }
     }
 
