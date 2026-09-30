@@ -694,23 +694,25 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         ))
     }
 
-    /// Send everything the guest has not acknowledged, once, now.
+    /// Nudge the oldest unacknowledged segment, once.
+    ///
+    /// Only the oldest, and only one segment's worth. The point is to break a
+    /// stall; resending the whole unacknowledged range spends the connection's
+    /// bandwidth on copies. That distinction matters because the common case here
+    /// is not loss at all -- the link to the guest drops nothing -- but the
+    /// guest's acknowledgment simply being late, and a peer that really did lose
+    /// something answers with duplicate acknowledgments, which prompt more
+    /// nudges.
     private func retransmit(_ connection: Connection) {
         connection.retransmitTimer?.cancel()
         connection.retransmitTimer = nil
         guard !connection.isClosed, !connection.sentNotAcked.isEmpty else { return }
 
+        let count = min(connection.peerMSS, connection.sentNotAcked.count)
         Self.log.info(
-            "retransmitting \(connection.sentNotAcked.count, privacy: .public)B to :\(connection.flow.sourcePort, privacy: .public) unacknowledged for \(String(format: "%.1f", Date().timeIntervalSince(connection.lastAckAdvance)), privacy: .public)s",
+            "nudging :\(connection.flow.sourcePort, privacy: .public) with \(count, privacy: .public)B, \(connection.sentNotAcked.count, privacy: .public)B unacknowledged for \(String(format: "%.1f", Date().timeIntervalSince(connection.lastAckAdvance)), privacy: .public)s",
         )
-        var sequence = connection.sentNotAckedSequence
-        var offset = 0
-        while offset < connection.sentNotAcked.count {
-            let end = min(offset + connection.peerMSS, connection.sentNotAcked.count)
-            resend(Array(connection.sentNotAcked[offset ..< end]), sequence: sequence, connection: connection)
-            sequence &+= UInt32(end - offset)
-            offset = end
-        }
+        resend(Array(connection.sentNotAcked[0 ..< count]), sequence: connection.sentNotAckedSequence, connection: connection)
         armRetransmission(connection)
     }
 
