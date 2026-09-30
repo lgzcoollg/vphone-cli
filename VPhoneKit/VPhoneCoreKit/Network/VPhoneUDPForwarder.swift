@@ -1,5 +1,6 @@
 import Foundation
 import SystemConfiguration
+import os
 
 // MARK: - Host resolver lookup
 
@@ -92,6 +93,7 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
     /// Marks `queue` as ours, so `sessionCount` can tell whether it is already on
     /// it rather than deadlocking against itself.
     private static let queueKey = DispatchSpecificKey<Void>()
+    private static let log = Logger(subsystem: "com.vphone.tunnel", category: "udp")
 
     init(configuration: VPhoneUserspaceNetworkConfiguration, queue: DispatchQueue, deliver: @escaping Deliver) {
         self.configuration = configuration
@@ -136,6 +138,7 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
         guard !isStopped else { return }
         guard let session = session(for: flow) else { return }
         session.lastActivity = Date()
+        Self.log.debug("udp out \(payload.count, privacy: .public)B -> \(String(describing: session.destination.address), privacy: .public):\(session.destination.port, privacy: .public)")
         payload.withUnsafeBytes { raw in
             // Qualified: the type has its own `send` for guest payloads.
             _ = Darwin.send(session.socket, raw.baseAddress, raw.count, 0)
@@ -205,6 +208,7 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
         source.setCancelHandler { close(descriptor) }
         source.resume()
         sessions[key] = session
+        Self.log.info("udp flow \(String(describing: flow.destinationAddress), privacy: .public):\(flow.destinationPort, privacy: .public) from :\(flow.sourcePort, privacy: .public) -> \(String(describing: destination.address), privacy: .public):\(destination.port, privacy: .public)")
         return session
     }
 
@@ -231,6 +235,7 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
             }
             if received <= 0 { return } // EAGAIN, or an ICMP error on the flow
             session.lastActivity = Date()
+            Self.log.info("udp reply \(received, privacy: .public)B from \(String(describing: session.destination.address), privacy: .public):\(session.destination.port, privacy: .public)")
             deliver(session.flow, Array(buffer[0 ..< received]))
         }
     }

@@ -287,7 +287,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
 
         readSource.resume()
         connections[flow.key] = connection
-        Self.log.debug("connect \(flow.destinationAddress):\(flow.destinationPort) from :\(flow.sourcePort)")
+        Self.log.info("connect \(flow.destinationAddress):\(flow.destinationPort) from :\(flow.sourcePort)")
     }
 
     private func finishConnect(_ connection: Connection) {
@@ -411,7 +411,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                     ), connection: connection)
                     offset = end
                 }
-                Self.log.debug("host -> guest \(received)B in \(payload.count / max(connection.peerMSS, 1) + 1) segment(s)")
+                Self.log.info("host -> guest \(received)B in \(payload.count / max(connection.peerMSS, 1) + 1) segment(s)")
                 continue
             }
             if received == 0 {
@@ -455,7 +455,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             windowSize: Self.advertisedWindow,
             advertisedMSS: Self.ourMSS,
         ), connection: connection)
-        Self.log.debug("handshake: SYN-ACK out, guest MSS \(connection.peerMSS)")
+        Self.log.info("handshake: SYN-ACK out, guest MSS \(connection.peerMSS)")
     }
 
     private func sendAcknowledgment(_ connection: Connection) {
@@ -495,7 +495,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     }
 
     private func finish(_ connection: Connection) {
-        Self.log.debug("close \(connection.flow.destinationAddress):\(connection.flow.destinationPort) from :\(connection.flow.sourcePort)")
+        Self.log.info("close \(connection.flow.destinationAddress):\(connection.flow.destinationPort) from :\(connection.flow.sourcePort)")
         close(connection)
         connections[connection.flow.key] = nil
     }

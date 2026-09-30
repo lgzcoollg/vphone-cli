@@ -1,5 +1,6 @@
 import Foundation
 import Virtualization
+import os
 
 // MARK: - Errors
 
@@ -48,6 +49,7 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     /// Held so the attachment (and therefore the VZ device tree) outlives us.
     private let attachment: VZFileHandleNetworkDeviceAttachment
     private let queue: DispatchQueue
+    private static let log = Logger(subsystem: "com.vphone.tunnel", category: "frames")
     private var source: DispatchSourceRead?
     /// Set by `stop()`. Cancelling the read source closes our descriptor once no
     /// handler is running, so the pair cannot be reopened after that.
@@ -85,6 +87,13 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             var size: Int32 = 4 << 20
             _ = setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &size, socklen_t(MemoryLayout<Int32>.size))
             _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
+            // Non-blocking is load-bearing. `drain` loops until recv reports
+            // EAGAIN, and everything -- the UDP and TCP forwarders included --
+            // shares this one serial queue. On a blocking socket the loop parks
+            // in recv the moment the guest goes quiet, which is exactly when it
+            // is waiting for a reply, so the reply is never read. The symptom is
+            // a guest whose DNS queries leave but whose answers never arrive.
+            _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL, 0) | O_NONBLOCK)
         }
 
         let guestEnd = descriptors[0]
@@ -115,6 +124,9 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             self.source = source
             forwarder.start()
             tcpForwarder.start()
+            Self.log.info(
+                "tunnel up: gateway \(String(describing: self.configuration.hostAddress), privacy: .public) guest \(String(describing: self.configuration.guestAddress), privacy: .public) mtu \(self.configuration.mtu, privacy: .public) resolver \(VPhoneHostResolver.preferred()?.description ?? "NONE", privacy: .public)",
+            )
         }
     }
 
@@ -147,6 +159,13 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             }
             if received <= 0 { return } // EAGAIN once the queue is empty
             let frame = Array(buffer[0 ..< received])
+            if let ethernet = VPhoneEthernetFrame(bytes: frame) {
+                let kind = VPhoneEtherType(rawValue: ethernet.etherType)
+                let summary = kind == .ipv4
+                    ? "ipv4 proto \(VPhoneIPv4Packet(bytes: ethernet.payload)?.proto ?? 0)"
+                    : (kind == .arp ? "arp" : "ethertype \(ethernet.etherType)")
+                Self.log.debug("guest -> \(frame.count, privacy: .public)B \(summary, privacy: .public)")
+            }
             switch responder.handle(frame) {
             case .drop:
                 continue
@@ -194,6 +213,14 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     }
 
     private func sendUDPReply(flow: VPhoneUDPFlow, payload: [UInt8]) {
+        // UDP has the same MTU ceiling TCP does, and no segmentation to fall
+        // back on: an oversized reply becomes an oversized IP packet that the
+        // guest drops. No fragmentation is implemented yet, so say so loudly
+        // rather than failing silently.
+        let wireSize = payload.count + 8 + 20
+        if wireSize > configuration.mtu {
+            Self.log.error("udp reply \(payload.count, privacy: .public)B exceeds mtu \(self.configuration.mtu, privacy: .public) — dropped")
+        }
         let datagram = VPhoneUDPDatagram(
             sourcePort: flow.destinationPort,
             destinationPort: flow.sourcePort,
