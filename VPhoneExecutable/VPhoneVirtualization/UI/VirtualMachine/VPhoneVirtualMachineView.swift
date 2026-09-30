@@ -643,6 +643,36 @@ class VPhoneVirtualMachineView: VZVirtualMachineView {
         }
     }
 
+    // MARK: - Back Gesture
+
+    /// Replay the system back gesture: a drag from the left edge toward the
+    /// centre.
+    ///
+    /// iOS has no back key. This is the gesture every app honours, so both the
+    /// Esc key and the Device menu's Back item come through here.
+    ///
+    /// The touch starts a hair inside the left edge on purpose: the system only
+    /// reads a drag as the back gesture when the touch *begins* in the
+    /// screen-edge zone. It goes through `injectSwipe`, which synthesises
+    /// ordinary mouse events, so the touch follows whichever injection path the
+    /// running base uses (vphoned on iOS 18, the native VZ multitouch path on
+    /// 26 and later).
+    func performBackGesture() {
+        guard let display = recordingGraphicsDisplay else { return }
+        let size = display.sizeInPixels
+        guard size.width > 0, size.height > 0 else { return }
+
+        injectSwipe(
+            fromX: size.width * 0.004,
+            fromY: size.height * 0.5,
+            toX: size.width * 0.85,
+            toY: size.height * 0.5,
+            screenWidth: Int(size.width),
+            screenHeight: Int(size.height),
+            durationMs: 320,
+        )
+    }
+
     // MARK: - Legacy Touch Injection (macOS 15)
 
     @discardableResult

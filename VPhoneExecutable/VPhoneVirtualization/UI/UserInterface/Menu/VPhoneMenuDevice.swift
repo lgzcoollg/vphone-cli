@@ -20,6 +20,15 @@ extension VPhoneMenuController {
             modifiers: [.command, .shift],
             symbol: "house",
         ))
+        // iOS has no back key, so Esc and this item both replay the system back
+        // gesture. No modifier: plain Esc is what the key is for.
+        menu.addItem(makeItem(
+            "Back",
+            action: #selector(sendBack),
+            keyEquivalent: "\u{1b}",
+            modifiers: [],
+            symbol: "arrow.uturn.backward",
+        ))
         menu.addItem(makeItem("Power", action: #selector(sendPower), symbol: "power"))
         menu.addItem(makeItem("Volume Up", action: #selector(sendVolumeUp), symbol: "speaker.plus"))
         menu.addItem(makeItem("Volume Down", action: #selector(sendVolumeDown), symbol: "speaker.minus"))
@@ -81,6 +90,13 @@ extension VPhoneMenuController {
 
     @objc func sendHome() {
         keySender.sendHome()
+    }
+
+    /// iOS has no back key. Esc and this item both replay the system back
+    /// gesture instead of forwarding a keystroke the guest would only read as
+    /// "cancel" (or, in Safari, "stop loading").
+    @objc func sendBack() {
+        captureView?.performBackGesture()
     }
 
     @objc func sendPower() {
