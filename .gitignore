@@ -357,3 +357,6 @@ VPhoneLaunchpad/Configuration/Developer.xcconfig
 VPhoneLaunchpad/Configuration/DevelopmentDeveloper.xcconfig
 .claude/worktrees
 .reasonix  
+# clang module cache that a stray `-Xcc` pass-through flag drops into
+# the project directory (v5/records/**.h-<hash>); never meaningful.
+-Xcc/
