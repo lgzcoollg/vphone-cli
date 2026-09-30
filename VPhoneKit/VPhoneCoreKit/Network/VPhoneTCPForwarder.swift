@@ -148,6 +148,13 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
 
         /// Guest payload not yet written to the host, waiting on its send buffer.
         var pendingToHost: [UInt8] = []
+        /// When the connection opened, for the closing summary.
+        let openedAt = Date()
+        /// Delivered in each direction, for the closing summary.
+        var bytesToHost = 0
+        var bytesToGuest = 0
+        /// Set by `finish`, so a connection is summarised and torn down once.
+        var isClosed = false
         /// Set once we have told the guest our window is shut, so a window update
         /// follows the moment the backlog clears.
         var guestWindowClosed = false
@@ -346,8 +353,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         _ = getsockopt(connection.socket, SOL_SOCKET, SO_ERROR, &error, &length)
         guard error == 0 else {
             sendReset(for: connection.flow, inReplyTo: nil)
-            close(connection)
-            connections[connection.flow.key] = nil
+            finish(connection)
             return
         }
         connection.state = .synAcknowledged
@@ -431,6 +437,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             let chunk = min(room, min(connection.peerMSS, connection.pendingToGuest.count))
             let data = Array(connection.pendingToGuest.prefix(chunk))
             connection.pendingToGuest.removeFirst(chunk)
+            connection.bytesToGuest += chunk
             send(.init(
                 sourcePort: connection.flow.destinationPort,
                 destinationPort: connection.flow.sourcePort,
@@ -472,6 +479,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     }
 
     private func writeToHost(_ payload: [UInt8], connection: Connection) {
+        connection.bytesToHost += payload.count
         connection.pendingToHost += payload
         flushToHost(connection)
     }
@@ -504,8 +512,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                 return
             }
             sendReset(for: connection.flow, inReplyTo: nil)
-            close(connection)
-            connections[connection.flow.key] = nil
+            finish(connection)
             return
         }
 
@@ -631,8 +638,18 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         deliver(flow, reset)
     }
 
+    /// Tear a connection down and say what it did.
+    ///
+    /// Idempotent: several paths can decide a connection is finished, and the
+    /// earlier version logged and tore down once per decision, which made the
+    /// log look like connections were being closed in pairs.
     private func finish(_ connection: Connection) {
-        Self.log.info("close \(connection.flow.destinationAddress):\(connection.flow.destinationPort) from :\(connection.flow.sourcePort)")
+        guard !connection.isClosed else { return }
+        connection.isClosed = true
+        let lifetime = Date().timeIntervalSince(connection.openedAt)
+        Self.log.info(
+            "\(connection.flow.destinationAddress, privacy: .public):\(connection.flow.destinationPort, privacy: .public) <- :\(connection.flow.sourcePort, privacy: .public) closed after \(String(format: "%.1f", lifetime), privacy: .public)s  up \(connection.bytesToHost, privacy: .public)B  down \(connection.bytesToGuest, privacy: .public)B",
+        )
         close(connection)
         connections[connection.flow.key] = nil
     }
