@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import VPhoneCoreKit
 
@@ -44,9 +45,13 @@ public enum VPhoneIPSWCache {
         }
     }
 
+    /// - Parameter label: what to call this archive on the progress line while it
+    ///   downloads. Defaults to the file name from the URL. A local file, or one
+    ///   already in the cache, never shows a line because nothing is transferred.
     public static func resolve(
         _ source: String,
         in cacheDirectory: URL,
+        label: String? = nil,
         session: URLSession = URLSession(configuration: .ephemeral),
     ) async throws -> Archive {
         guard let url = URL(string: source), let scheme = url.scheme?.lowercased() else {
@@ -79,7 +84,9 @@ public enum VPhoneIPSWCache {
         }
         let output = try FileHandle(forWritingTo: pending)
         defer { try? output.close() }
-        let (response, size) = try await download(request, into: output, session: session)
+        let (response, size) = try await download(
+            request, into: output, session: session, label: label ?? url.lastPathComponent,
+        )
         try output.close()
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw Error.unexpectedHTTP(url, (response as? HTTPURLResponse)?.statusCode ?? 0)
@@ -175,9 +182,10 @@ public enum VPhoneIPSWCache {
         _ request: URLRequest,
         into output: FileHandle,
         session: URLSession,
+        label: String,
     ) async throws -> (URLResponse, Int64) {
         let task = session.dataTask(with: request)
-        let writer = DownloadWriter(output: output)
+        let writer = DownloadWriter(output: output, label: label)
         task.delegate = writer
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -194,12 +202,15 @@ public enum VPhoneIPSWCache {
     private final class DownloadWriter: NSObject, URLSessionDataDelegate, @unchecked Sendable {
         let output: FileHandle
         var continuation: CheckedContinuation<(URLResponse, Int64), Swift.Error>?
+        private let label: String
+        private var progress: DownloadProgress?
         private var response: URLResponse?
         private var written: Int64 = 0
         private var writeError: Swift.Error?
 
-        init(output: FileHandle) {
+        init(output: FileHandle, label: String) {
             self.output = output
+            self.label = label
         }
 
         func urlSession(
@@ -210,6 +221,10 @@ public enum VPhoneIPSWCache {
         ) {
             self.response = response
             let ok = (response as? HTTPURLResponse)?.statusCode == 200
+            if ok, response.expectedContentLength > 0 {
+                progress = DownloadProgress(label: label, expected: response.expectedContentLength)
+                progress?.draw(written: 0)
+            }
             completionHandler(ok ? .allow : .cancel)
         }
 
@@ -218,6 +233,7 @@ public enum VPhoneIPSWCache {
             do {
                 try output.write(contentsOf: data)
                 written += Int64(data.count)
+                progress?.draw(written: written)
             } catch {
                 writeError = error
                 dataTask.cancel()
@@ -225,7 +241,7 @@ public enum VPhoneIPSWCache {
         }
 
         func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: Swift.Error?) {
-            defer { continuation = nil }
+            defer { progress = nil; continuation = nil }
             if let writeError {
                 continuation?.resume(throwing: writeError)
             } else if let response, (response as? HTTPURLResponse)?.statusCode != 200 {
@@ -238,6 +254,88 @@ public enum VPhoneIPSWCache {
             } else {
                 continuation?.resume(throwing: URLError(.badServerResponse))
             }
+        }
+    }
+
+    /// One line of download progress, redrawn in place with `\r`.
+    ///
+    /// The line is written only when standard output is a terminal, so a piped
+    /// or redirected run stays byte-for-byte what it used to be: a script that
+    /// captures `fw prepare` keeps its output, and a log never sees the redraws.
+    /// The closing newline is emitted once, when the writer drops this.
+    private final class DownloadProgress: @unchecked Sendable {
+        private static let barCells = 24
+        private static let labelLimit = 28
+
+        private let label: String
+        private let expected: Int64
+        private let enabled: Bool
+        private let started = Date()
+        private var lastDraw = Date.distantPast
+        private var drew = false
+
+        init(label: String, expected: Int64) {
+            self.label = label.count > Self.labelLimit
+                ? String(label.prefix(Self.labelLimit - 1)) + "…"
+                : label
+            self.expected = expected
+            enabled = isatty(STDOUT_FILENO) == 1
+        }
+
+        deinit {
+            guard enabled, drew else { return }
+            FileHandle.standardOutput.write(Data("\n".utf8))
+        }
+
+        func draw(written: Int64) {
+            guard enabled else { return }
+            // One write per chunk would be thousands of them. ~7 a second reads
+            // as live without the download ever noticing; the final size always
+            // gets through.
+            let now = Date()
+            guard written >= expected || now.timeIntervalSince(lastDraw) >= 0.15 else { return }
+            lastDraw = now
+            drew = true
+            FileHandle.standardOutput.write(Data(("\r" + line(written: written)).utf8))
+        }
+
+        private func line(written: Int64) -> String {
+            let fraction = expected > 0 ? min(1, max(0, Double(written) / Double(expected))) : 0
+            let elapsed = max(0.001, Date().timeIntervalSince(started))
+            let rate = Double(written) / elapsed
+
+            let filled = Int((fraction * Double(Self.barCells)).rounded())
+            let bar = String(repeating: "█", count: filled)
+                + String(repeating: "░", count: Self.barCells - filled)
+
+            var text = "\(label)  \(bar)  \(Int(fraction * 100))%"
+            text += "  \(Self.bytes(written))/\(Self.bytes(expected))"
+            text += "  \(Self.bytes(Int64(rate)))/s"
+            if written >= expected {
+                text += "  done"
+            } else if fraction > 0 {
+                text += "  ETA \(Self.duration(elapsed * (1 - fraction) / fraction))"
+            }
+            return text
+        }
+
+        private static func bytes(_ value: Int64) -> String {
+            let units = ["B", "KB", "MB", "GB", "TB"]
+            var value = Double(max(0, value))
+            var unit = 0
+            while value >= 1000, unit < units.count - 1 {
+                value /= 1000
+                unit += 1
+            }
+            return unit == 0 ? "\(Int(value)) \(units[unit])" : String(format: "%.1f %@", value, units[unit])
+        }
+
+        private static func duration(_ seconds: Double) -> String {
+            guard seconds.isFinite, seconds > 0 else { return "?" }
+            let total = Int(seconds.rounded())
+            if total < 60 { return "\(total)s" }
+            if total < 3600 { return "\(total / 60)m" }
+            return "\(total / 3600)h \((total % 3600) / 60)m"
         }
     }
 

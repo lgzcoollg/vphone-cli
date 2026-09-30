@@ -48,13 +48,19 @@ enum VPhoneFirmwarePreparer {
         // Remote IPSWs go to one cache shared by every machine; keeping them
         // inside the machine downloaded both again for each new one (#513).
         // Local IPSWs are read in place and are never copied into the cache.
+        // A remote IPSW that is not cached yet shows a progress line while it
+        // transfers; the label is what that line calls it.
         print("[*] Resolving iPhone IPSW...")
         let phone = try vphoneRunBlocking {
-            try await VPhoneIPSWCache.resolve(iPhoneSource, in: ipswCacheDirectory)
+            try await VPhoneIPSWCache.resolve(
+                iPhoneSource, in: ipswCacheDirectory, label: "iPhone IPSW",
+            )
         }
         print("[*] Resolving cloudOS IPSW...")
         let cloud = try vphoneRunBlocking {
-            try await VPhoneIPSWCache.resolve(cloudOSSource, in: ipswCacheDirectory)
+            try await VPhoneIPSWCache.resolve(
+                cloudOSSource, in: ipswCacheDirectory, label: "cloudOS IPSW",
+            )
         }
         try VPhoneIPSWCache.checkPair(iPhone: phone, cloudOS: cloud)
         try checkIPhoneName(iPhoneSource, archive: phone)
