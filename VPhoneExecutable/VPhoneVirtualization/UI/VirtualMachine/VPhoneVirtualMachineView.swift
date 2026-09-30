@@ -764,7 +764,6 @@ class VPhoneVirtualMachineView: VZVirtualMachineView {
         let y = (localPoint.y - rect.minY) / rect.height
         return CGPoint(x: x, y: geometry.isFlipped ? y : 1 - y)
     }
-    }
 
     private func hitTestEdge(at point: CGPoint) -> Int {
         displayGeometry.edge(at: point).rawValue
@@ -787,7 +786,7 @@ extension VPhoneVirtualMachineView: NSMenuItemValidation {
 // MARK: - Trackpad Gesture Preference
 
 /// User preference for replaying trackpad scroll/pinch gestures as guest
-/// touches. Enabled by default; the Keys menu exposes the toggle.
+/// touches. Enabled by default; the Device menu exposes the toggle.
 enum VPhoneTrackpadGestures {
     private static let disabledKey = "trackpadGesturesDisabled"
 
