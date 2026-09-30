@@ -74,6 +74,10 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     /// One read at a time from the host. Larger than an MSS on purpose: fewer
     /// syscalls, and the split into segments happens below anyway.
     private static let readCapacity = 65536
+    /// Cap on data buffered for a guest whose window is closed. The host socket's
+    /// own receive buffer applies backpressure beyond this: we stop draining it,
+    /// so the kernel stops acknowledging the server and the server stops sending.
+    private static let maxPendingToGuest = 1 << 20
     private static let log = Logger(subsystem: "com.vphone.tunnel", category: "tcp")
 
     private enum State {
@@ -109,6 +113,31 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         /// Every segment we build is split to fit it.
         var peerMSS: Int
 
+        // MARK: Sending toward the guest
+        //
+        // The link to the guest is local and does not lose packets, so the only
+        // way data can go missing is by sending more than the guest has buffer
+        // for. The send side therefore tracks the guest's advertised window and
+        // never runs past it. That is not an optimisation: without it the guest
+        // drops the overflow silently, never acknowledges it, and the transfer
+        // stops dead -- which is what "downloads crawl and then hang" was.
+
+        /// Right edge of the guest's advertised receive window, i.e. the highest
+        /// sequence number we may send. Starts at `localSequence` so nothing goes
+        /// out until the guest's first ACK says how much room there is.
+        var sendWindowRight: UInt32
+        /// Earliest sequence number the guest has not acknowledged. Reported, not
+        /// relied on: the window check above is what prevents loss.
+        var sendUna: UInt32
+        /// Read from the host, not yet sent, because the window had no room.
+        var pendingToGuest: [UInt8] = []
+        /// A FIN queued behind `pendingToGuest`.
+        var pendingFIN = false
+        /// Set while the host read source is suspended because the buffer above
+        /// is full. Sources are level-triggered, so one that is not drained has
+        /// to be suspended or it spins.
+        var readSuspended = false
+
         init(flow: VPhoneTCPFlow, socket: Int32, readSource: DispatchSourceRead, state: State, localSequence: UInt32, remoteSequence: UInt32, peerMSS: Int) {
             self.flow = flow
             self.socket = socket
@@ -117,6 +146,8 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             self.localSequence = localSequence
             self.remoteSequence = remoteSequence
             self.peerMSS = peerMSS
+            self.sendWindowRight = localSequence
+            self.sendUna = localSequence
         }
     }
 
@@ -215,6 +246,8 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         case .synAcknowledged:
             guard segment.hasACK, segment.acknowledgmentNumber == connection.localSequence else { return }
             connection.state = .established
+            connection.sendWindowRight = segment.acknowledgmentNumber &+ UInt32(segment.windowSize)
+            connection.sendUna = segment.acknowledgmentNumber
             flushPending(connection)
 
         case .established, .closing:
@@ -309,6 +342,18 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
 
     /// Data (or a FIN) in one direction or the other.
     private func consume(_ segment: VPhoneTCPSegment, connection: Connection) {
+        // The guest's ACK is also its window advertisement, and therefore the
+        // only thing that tells the send side how much room there is. Reading it
+        // here is what keeps a transfer moving instead of stalling after the
+        // first burst.
+        if segment.hasACK {
+            connection.sendWindowRight = segment.acknowledgmentNumber &+ UInt32(segment.windowSize)
+            if Self.isAfter(segment.acknowledgmentNumber, connection.sendUna) {
+                connection.sendUna = segment.acknowledgmentNumber
+            }
+            flushToGuest(connection)
+        }
+
         if !segment.payload.isEmpty {
             if segment.sequenceNumber == connection.remoteSequence {
                 writeToHost(segment.payload, connection: connection)
@@ -343,11 +388,62 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             // Half-close: the guest is done sending, but still wants our data.
             shutdown(connection.socket, SHUT_WR)
             sendAcknowledgment(connection)
-            if connection.hostClosed || connection.state == .closing {
-                finish(connection)
-            } else {
-                connection.state = .closing
-            }
+            connection.state = .closing
+            finishIfBothClosed(connection)
+        }
+    }
+
+    /// Tear down only once neither side has anything left to deliver.
+    ///
+    /// The earlier version closed as soon as a FIN was seen in both directions,
+    /// which threw away data still queued for the guest.
+    private func finishIfBothClosed(_ connection: Connection) {
+        guard connection.hostClosed, connection.guestClosed else { return }
+        guard connection.pendingToGuest.isEmpty, !connection.pendingFIN else { return }
+        finish(connection)
+    }
+
+    /// Send as much queued data as the guest's window allows.
+    ///
+    /// Two limits apply to every segment: the guest's MSS, so it fits in one MTU,
+    /// and the guest's window, so it fits in the guest's buffer. Both were
+    /// learned from the guest. Running past either one loses the data silently.
+    private func flushToGuest(_ connection: Connection) {
+        while !connection.pendingToGuest.isEmpty {
+            let room = Int(Int32(bitPattern: connection.sendWindowRight &- connection.localSequence))
+            guard room > 0 else { break }
+            let chunk = min(room, min(connection.peerMSS, connection.pendingToGuest.count))
+            let data = Array(connection.pendingToGuest.prefix(chunk))
+            connection.pendingToGuest.removeFirst(chunk)
+            send(.init(
+                sourcePort: connection.flow.destinationPort,
+                destinationPort: connection.flow.sourcePort,
+                sequenceNumber: connection.localSequence,
+                acknowledgmentNumber: connection.remoteSequence,
+                flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.psh,
+                windowSize: Self.advertisedWindow,
+                payload: data,
+            ), connection: connection)
+        }
+
+        if connection.pendingToGuest.isEmpty, connection.pendingFIN {
+            connection.pendingFIN = false
+            send(.init(
+                sourcePort: connection.flow.destinationPort,
+                destinationPort: connection.flow.sourcePort,
+                sequenceNumber: connection.localSequence,
+                acknowledgmentNumber: connection.remoteSequence,
+                flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.fin,
+                windowSize: Self.advertisedWindow,
+            ), connection: connection)
+            finishIfBothClosed(connection)
+            if connection.state == .closing, connection.pendingToGuest.isEmpty { return }
+        }
+
+        // Room again: resume a source that was paused for backpressure.
+        if connection.readSuspended, connection.pendingToGuest.count < Self.maxPendingToGuest {
+            connection.readSource.resume()
+            connection.readSuspended = false
         }
     }
 
@@ -385,6 +481,17 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     // MARK: - Host to guest
 
     private func drainHost(_ connection: Connection) {
+        // Stop draining the host while the guest's window is closed. Leaving the
+        // data in the kernel is the point: its receive buffer fills, it stops
+        // acknowledging the server, and the server stops sending.
+        if connection.pendingToGuest.count >= Self.maxPendingToGuest {
+            if !connection.readSuspended {
+                connection.readSource.suspend()
+                connection.readSuspended = true
+            }
+            return
+        }
+
         var buffer = [UInt8](repeating: 0, count: Self.readCapacity)
         while true {
             let received = buffer.withUnsafeMutableBytes { raw in
@@ -392,45 +499,21 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             }
             if received > 0 {
                 connection.lastActivity = Date()
-                let payload = Array(buffer[0 ..< received])
-                // A single segment may not exceed what the guest said it can
-                // take. Without this the segment runs past the MTU and the guest
-                // drops it silently -- which is what made small responses (the
-                // activation handshake) work and anything larger appear to hang.
-                var offset = 0
-                while offset < payload.count {
-                    let end = min(offset + connection.peerMSS, payload.count)
-                    send(.init(
-                        sourcePort: connection.flow.destinationPort,
-                        destinationPort: connection.flow.sourcePort,
-                        sequenceNumber: connection.localSequence,
-                        acknowledgmentNumber: connection.remoteSequence,
-                        flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.psh,
-                        windowSize: Self.advertisedWindow,
-                        payload: Array(payload[offset ..< end]),
-                    ), connection: connection)
-                    offset = end
-                }
-                Self.log.info("host -> guest \(received)B in \(payload.count / max(connection.peerMSS, 1) + 1) segment(s)")
+                connection.pendingToGuest += buffer[0 ..< received]
+                flushToGuest(connection)
+                if connection.pendingToGuest.count >= Self.maxPendingToGuest { break }
                 continue
             }
             if received == 0 {
-                // The host closed. Tell the guest, unless it already went first.
+                // The host closed. The FIN goes out behind whatever is still
+                // queued, so the guest does not see it before the data.
                 connection.lastActivity = Date()
                 if !connection.hostClosed {
                     connection.hostClosed = true
-                    send(.init(
-                        sourcePort: connection.flow.destinationPort,
-                        destinationPort: connection.flow.sourcePort,
-                        sequenceNumber: connection.localSequence,
-                        acknowledgmentNumber: connection.remoteSequence,
-                        flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.fin,
-                        windowSize: Self.advertisedWindow,
-                    ), connection: connection)
+                    connection.pendingFIN = true
+                    flushToGuest(connection)
                 }
-                if connection.guestClosed || connection.state == .closing {
-                    finish(connection)
-                }
+                finishIfBothClosed(connection)
                 return
             }
             // EAGAIN. A real error is indistinguishable here from a closed peer,
@@ -503,6 +586,12 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     private func close(_ connection: Connection) {
         connection.writeSource?.cancel()
         connection.writeSource = nil
+        // A suspended source must be resumed before it can be cancelled;
+        // libdispatch aborts the process for releasing a suspended object.
+        if connection.readSuspended {
+            connection.readSource.resume()
+            connection.readSuspended = false
+        }
         // The cancel handler closes the descriptor, but only once no handler is
         // running, which is what keeps `drainHost` from touching a freed fd.
         connection.readSource.cancel()
@@ -516,6 +605,11 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             close(connection)
             connections[key] = nil
         }
+    }
+
+    /// Wrap-safe TCP sequence comparison: is `a` after `b`?
+    private static func isAfter(_ a: UInt32, _ b: UInt32) -> Bool {
+        Int32(bitPattern: a &- b) > 0
     }
 
     private func nextSequence() -> UInt32 {
