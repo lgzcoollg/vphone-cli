@@ -356,3 +356,4 @@ setup_logs/
 VPhoneLaunchpad/Configuration/Developer.xcconfig
 VPhoneLaunchpad/Configuration/DevelopmentDeveloper.xcconfig
 .claude/worktrees
+.reasonix  
