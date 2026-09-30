@@ -9,14 +9,8 @@
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleVersion</key>
-	<string>18</string>
+	<string>21</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.2.0</string>
-	<key>NSLocationUsageDescription</key>
-	<string>Shares your location with the virtual iPhone so apps running inside it see the same location.</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Shares your location with the virtual iPhone so apps running inside it see the same location.</string>
-	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Shares your location with the virtual iPhone so apps running inside it see the same location.</string>
+	<string>2.2.3</string>
 </dict>
 </plist>

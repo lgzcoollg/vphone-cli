@@ -569,8 +569,8 @@ struct VPhoneCustomFirmwareInstaller {
         }
         // Version-agnostic: the guest is hacktivated on every base, so the
         // profile check this opens fails on every base too. Off in `standard`,
-        // because libmisfix declines the same check from userspace in installd
-        // and misagent without touching the cache — see
+        // because libmisfix declines the same check from userspace in installd,
+        // misagent and SpringBoard without touching the cache — see
         // FirmwarePatchSetCatalog.misTrustAuthPatch for why editing the cache
         // is the worse trade on 27.
         if on(FirmwarePatchSetCatalog.misTrustAuthPatch) {
@@ -655,28 +655,7 @@ struct VPhoneCustomFirmwareInstaller {
                 injectedDylibPath: "/vh",
             )
         }
-        if on("system-installd-cfw-adhoc_signature") {
-            // No bytes of installd's own change: the hook rides in on a weak
-            // load command and does its work through dyld interposition.
-            try patchMachO(
-                system: system,
-                work: work,
-                path: "usr/libexec/installd",
-                identifier: "com.apple.installd",
-                preserveEntitlements: true,
-                injectedDylibPath: "/usr/lib/libmisfix.dylib",
-            )
-        }
-        if on("system-misagent-cfw-device_identity") {
-            try patchMachO(
-                system: system,
-                work: work,
-                path: "usr/libexec/misagent",
-                identifier: "com.apple.misagent",
-                preserveEntitlements: true,
-                injectedDylibPath: "/usr/lib/libmisfix.dylib",
-            )
-        }
+        try restoreMISFixTargets(system: system)
         if on("system-debugserver-cfw-install") {
             try patchDebugserver(system: system, work: work)
         }
@@ -921,16 +900,43 @@ struct VPhoneCustomFirmwareInstaller {
         }
         // launchd has little free header space for another load command.
         // /vh fits the same 32-byte command as the old /b without reusing it.
-        let alias = "vh"
-        let target = "/usr/lib/launchdhook-vphone.dylib"
+        try installLibraryAlias(system: system, alias: "vh", target: "/usr/lib/launchdhook-vphone.dylib")
+        try installMISFixDefaults(system: system)
+    }
+
+    /// A symlink at the volume root, so a load command in a binary with little
+    /// header space can name a library in seven bytes or fewer.
+    private func installLibraryAlias(system: VPhoneConfinedDirectory, alias: String, target: String) throws {
         if try system.exists(alias) {
             guard try system.readLink(alias) == target else {
-                throw ValidationError("Another file already uses /vh on the VM system volume. Remove it, then install CFW again.")
+                throw ValidationError("Another file already uses /\(alias) on the VM system volume. Remove it, then install CFW again.")
             }
         } else {
             try system.createSymlink(target: target, at: alias)
         }
-        try installMISFixDefaults(system: system)
+    }
+
+    /// Put back the Apple binaries earlier installs linked libmisfix into.
+    ///
+    /// installd, misagent and SpringBoard now get the hook the way every other
+    /// guest process gets SystemHook: the spawn hooks insert it (see
+    /// `vpIsMISFixTarget` in `VPhoneGuestComponents/Shared/InjectionEnvironment.h`).
+    /// A guest installed before that still carries a load command in each, and
+    /// `patchMachO` left the original beside it as `.bak`. The `/mf` alias
+    /// existed only for SpringBoard's.
+    private func restoreMISFixTargets(system: VPhoneConfinedDirectory) throws {
+        let targets = [
+            "usr/libexec/installd",
+            "usr/libexec/misagent",
+            "System/Library/CoreServices/SpringBoard.app/SpringBoard",
+        ]
+        for path in targets where try system.isRegularFile("\(path).bak") {
+            try system.rename("\(path).bak", to: path)
+            print("  [+] \(path): restored the original, libmisfix is inserted at spawn")
+        }
+        if try system.isSymlink("mf"), try system.readLink("mf") == "/usr/lib/libmisfix.dylib" {
+            try system.removeItem("mf")
+        }
     }
 
     /// libmisfix's settings file, and only when the guest has none.

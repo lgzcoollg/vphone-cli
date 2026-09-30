@@ -81,11 +81,8 @@ public enum FirmwareGuestSystemPatchSet {
                 summary: """
                 Accepts a provisioning profile that wants online authorization, by short-circuiting \
                 the check in the shared cache. Off by default: libmisfix.dylib already declines the \
-                same check from userspace in installd and misagent, and editing the cache for it \
-                stops an iOS 27 guest booting. Turn it on only on a 26.x base, and only to launch \
-                an app signed with a free personal-team certificate — that launch goes through \
-                SpringBoard, which the hook does not cover. Not offered on iOS 27, where it stops \
-                the guest booting.
+                same check from userspace in installd, misagent and SpringBoard, and editing the \
+                cache for it stops an iOS 27 guest booting. Not offered on iOS 27.
                 """,
                 target: .dyldSharedCache,
                 applicability: misTrustAuthBases,
@@ -129,38 +126,6 @@ public enum FirmwareGuestSystemPatchSet {
                 bootEssential: true,
             ),
             VPhonePatchDeclaration(
-                identifier: "system-installd-cfw-adhoc_signature",
-                title: "installd signature policy",
-                summary: """
-                Lets Xcode install an app the guest would otherwise refuse. installd asks \
-                MobileIdentityService to validate a bundle without allowing an ad-hoc \
-                signature and insists on a provisioning profile no VM can satisfy, so an \
-                install fails at 0xE8008014 or 0xE8008015 even though the guest runs \
-                unsigned code perfectly well. A hook in /usr/lib/libmisfix.dylib, loaded \
-                into installd, sets the options MIS already understands, answers \
-                ProvisionsAllDevices for every profile, and turns on the ad-hoc switch \
-                MICodeSigningVerifier carries and installd never sets. Nothing in the dyld \
-                shared cache is written on disk: the libmis functions are detoured in \
-                installd's own copy-on-write pages.
-                """,
-                target: .guestExecutable(path: "/usr/libexec/installd"),
-            ),
-            VPhonePatchDeclaration(
-                identifier: "system-misagent-cfw-device_identity",
-                title: "misagent profile scope",
-                summary: """
-                Lets any provisioning profile install on this guest. misagent asks the \
-                profile whether it provisions all devices and otherwise compares its \
-                ProvisionedDevices against the UDID MobileGestalt reports; a VM's UDID is \
-                in nobody's list, so a paid team's profile fails at 0xE8008012. The same \
-                hook, loaded into misagent, answers the first question yes, so the profile \
-                installs for real and the app is validated against it. It can also answer \
-                the UDID query with a device set in /usr/lib/libmisfix.plist, which is off \
-                until one is set and does not change what Xcode or lockdown report.
-                """,
-                target: .guestExecutable(path: "/usr/libexec/misagent"),
-            ),
-            VPhonePatchDeclaration(
                 identifier: "system-debugserver-cfw-install",
                 title: "debugserver",
                 summary: "Installs a debugserver that can attach in the guest.",
@@ -200,7 +165,13 @@ public enum FirmwareGuestSystemPatchSet {
             VPhonePatchDeclaration(
                 identifier: "system-launchdaemons-boot-environment",
                 title: "Guest environment",
-                summary: "Installs the launchd environment and plists the guest tools read.",
+                summary: """
+                Installs the launchd environment and plists the guest tools read, and the hooks \
+                launchd and SystemHook insert at spawn. Among them is libmisfix.dylib, inserted \
+                into installd, misagent and SpringBoard, which lets Xcode install and launch an \
+                app signed for someone else's team, or ad hoc, without writing the shared cache, \
+                and into lockdownd and remoted, which tell the host a configured UDID.
+                """,
                 target: .guestFile(path: "/Library/LaunchDaemons"),
                 bootEssential: true,
             ),
