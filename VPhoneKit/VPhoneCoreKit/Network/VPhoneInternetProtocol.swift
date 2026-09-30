@@ -349,6 +349,17 @@ struct VPhoneTCPSegment {
     var maximumSegmentSize: Int?
     /// Our own MSS, advertised on SYN-ACK. Set when we build the handshake.
     var advertisedMSS: Int?
+    /// The peer's window scale, when its SYN carried option 3.
+    ///
+    /// Window scaling exists because a 16-bit field cannot express a window large
+    /// enough for a fat, long path. Both ends must offer it or neither uses it,
+    /// so a peer that finds no option 3 in our SYN-ACK has to keep its receive
+    /// window under 65535 -- and that ceiling, divided by the round-trip time, is
+    /// the most this connection can ever carry.
+    var windowScale: Int?
+    /// Our own window scale, advertised on SYN-ACK so the guest may use a large
+    /// window. Only set when the guest offered one too.
+    var advertisedWindowScale: Int?
 
     init(
         sourcePort: UInt16,
@@ -360,6 +371,8 @@ struct VPhoneTCPSegment {
         payload: [UInt8] = [],
         maximumSegmentSize: Int? = nil,
         advertisedMSS: Int? = nil,
+        windowScale: Int? = nil,
+        advertisedWindowScale: Int? = nil,
     ) {
         self.sourcePort = sourcePort
         self.destinationPort = destinationPort
@@ -370,6 +383,8 @@ struct VPhoneTCPSegment {
         self.payload = payload
         self.maximumSegmentSize = maximumSegmentSize
         self.advertisedMSS = advertisedMSS
+        self.windowScale = windowScale
+        self.advertisedWindowScale = advertisedWindowScale
     }
 
     var hasSYN: Bool { flags & VPhoneTCPFlags.syn != 0 }
@@ -384,11 +399,16 @@ struct VPhoneTCPSegment {
     }
 
     func bytes(source: VPhoneIPv4Address, destination: VPhoneIPv4Address) -> [UInt8] {
-        // Option 2 (maximum segment size) is the only option we emit, and only
-        // when asked. Four bytes keeps the header on a 32-bit boundary.
+        // Option 2 (maximum segment size) and option 3 (window scale), each only
+        // when asked. The list is padded to a 32-bit boundary, which is what the
+        // data offset counts in.
         var options: [UInt8] = []
         if let advertisedMSS {
-            options = [2, 4, UInt8(truncatingIfNeeded: advertisedMSS >> 8), UInt8(truncatingIfNeeded: advertisedMSS)]
+            options += [2, 4, UInt8(truncatingIfNeeded: advertisedMSS >> 8), UInt8(truncatingIfNeeded: advertisedMSS)]
+        }
+        if let advertisedWindowScale {
+            options += [3, 3, UInt8(truncatingIfNeeded: advertisedWindowScale)]
+            while options.count % 4 != 0 { options.append(1) } // NOP padding
         }
         let headerLength = 20 + options.count
         var header: [UInt8] = [
@@ -428,28 +448,35 @@ struct VPhoneTCPSegment {
         flags = bytes[13]
         windowSize = UInt16(bytes[14]) << 8 | UInt16(bytes[15])
         payload = Array(bytes[headerLength...])
-        maximumSegmentSize = Self.mss(inOptions: Array(bytes[20 ..< headerLength]))
+        let parsed = Self.options(in: Array(bytes[20 ..< headerLength]))
+        maximumSegmentSize = parsed.mss
+        windowScale = parsed.windowScale
     }
 
-    /// The MSS a peer offered, if any.
+    /// The options we care about, read in one pass.
     ///
-    /// Option 2 carries its length in the second byte. A malformed option list
-    /// ends the walk rather than guessing: a peer that sends a broken one gets
-    /// the RFC 1122 default instead of a wrong number.
-    private static func mss(inOptions options: [UInt8]) -> Int? {
+    /// Option 2 carries the peer's MSS and option 3 its window scale; everything
+    /// else is skipped by its length. A malformed list ends the walk rather than
+    /// guessing -- a peer that sends a broken option gets the RFC 1122 MSS
+    /// default and no window scaling, which is the safe direction both times.
+    private static func options(in options: [UInt8]) -> (mss: Int?, windowScale: Int?) {
+        var mss: Int?
+        var windowScale: Int?
         var index = 0
         while index < options.count {
             let kind = options[index]
-            if kind == 0 { return nil } // end of options
+            if kind == 0 { break } // end of options
             if kind == 1 { index += 1; continue } // no-op padding
-            guard index + 1 < options.count else { return nil }
+            guard index + 1 < options.count else { break }
             let length = Int(options[index + 1])
-            guard length >= 2, index + length <= options.count else { return nil }
+            guard length >= 2, index + length <= options.count else { break }
             if kind == 2, length == 4 {
-                return Int(UInt16(options[index + 2]) << 8 | UInt16(options[index + 3]))
+                mss = Int(UInt16(options[index + 2]) << 8 | UInt16(options[index + 3]))
+            } else if kind == 3, length == 3 {
+                windowScale = Int(options[index + 2])
             }
             index += length
         }
-        return nil
+        return (mss, windowScale)
     }
 }

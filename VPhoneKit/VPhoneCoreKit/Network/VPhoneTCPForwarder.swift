@@ -69,6 +69,14 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     /// IPv4 and TCP headers. Sent as option 2 in the SYN-ACK. Keep in step with
     /// `VPhoneUserspaceNetworkConfiguration.default.mtu`.
     private static let ourMSS = 1460
+    /// The shift we offer for window scaling, when the guest offers it too.
+    ///
+    /// A 16-bit window over a path with any latency is the throughput ceiling:
+    /// 64 KiB at 100 ms is 640 KiB/s no matter how fast the link is. Offering a
+    /// scale lets the guest advertise a window it could not otherwise express,
+    /// which is what lets a download run at the link's speed instead of
+    /// 65535/RTT.
+    private static let ourWindowScaleShift = 7
     /// What to assume when the guest's SYN carries no MSS option. RFC 1122's
     /// floor, chosen so an unadvertised peer never gets an oversized segment.
     private static let defaultPeerMSS = 536
@@ -113,6 +121,14 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         /// The guest's MSS from its SYN, or the RFC floor when it sent none.
         /// Every segment we build is split to fit it.
         var peerMSS: Int
+        /// How far to shift the guest's window field. Zero unless scaling was
+        /// negotiated; reading an unscaled window as if it were scaled would
+        /// badly overestimate the room available.
+        var peerWindowScale: Int
+        /// True when both ends offered window scaling, so our own advertised
+        /// window is shifted on the way out and the guest's is shifted on the
+        /// way in.
+        var windowScaleNegotiated = false
 
         // MARK: Sending toward the guest
         //
@@ -159,7 +175,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         /// follows the moment the backlog clears.
         var guestWindowClosed = false
 
-        init(flow: VPhoneTCPFlow, socket: Int32, readSource: DispatchSourceRead, state: State, localSequence: UInt32, remoteSequence: UInt32, peerMSS: Int) {
+        init(flow: VPhoneTCPFlow, socket: Int32, readSource: DispatchSourceRead, state: State, localSequence: UInt32, remoteSequence: UInt32, peerMSS: Int, peerWindowScale: Int) {
             self.flow = flow
             self.socket = socket
             self.readSource = readSource
@@ -167,6 +183,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             self.localSequence = localSequence
             self.remoteSequence = remoteSequence
             self.peerMSS = peerMSS
+            self.peerWindowScale = peerWindowScale
             self.sendWindowRight = localSequence
             self.sendUna = localSequence
         }
@@ -267,7 +284,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         case .synAcknowledged:
             guard segment.hasACK, segment.acknowledgmentNumber == connection.localSequence else { return }
             connection.state = .established
-            connection.sendWindowRight = segment.acknowledgmentNumber &+ UInt32(segment.windowSize)
+            connection.sendWindowRight = segment.acknowledgmentNumber &+ Self.expand(segment.windowSize, by: connection.peerWindowScale)
             connection.sendUna = segment.acknowledgmentNumber
             flushPending(connection)
 
@@ -313,7 +330,9 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             // A SYN occupies one sequence number.
             remoteSequence: segment.sequenceNumber &+ 1,
             peerMSS: segment.maximumSegmentSize ?? Self.defaultPeerMSS,
+            peerWindowScale: segment.windowScale ?? 0,
         )
+        connection.windowScaleNegotiated = segment.windowScale != nil
         readSource.setEventHandler { [weak self] in self?.drainHost(connection) }
         // Qualified: the type has its own `close` for tearing a connection down.
         readSource.setCancelHandler { Darwin.close(descriptor) }
@@ -367,7 +386,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         // here is what keeps a transfer moving instead of stalling after the
         // first burst.
         if segment.hasACK {
-            connection.sendWindowRight = segment.acknowledgmentNumber &+ UInt32(segment.windowSize)
+            connection.sendWindowRight = segment.acknowledgmentNumber &+ Self.expand(segment.windowSize, by: connection.peerWindowScale)
             if Self.isAfter(segment.acknowledgmentNumber, connection.sendUna) {
                 connection.sendUna = segment.acknowledgmentNumber
             }
@@ -387,7 +406,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                     sequenceNumber: connection.localSequence,
                     acknowledgmentNumber: connection.remoteSequence,
                     flags: VPhoneTCPFlags.ack,
-                    windowSize: advertisedWindowSize(connection),
+                    windowSize: advertisedWindowField(connection),
                 ), connection: connection)
             } else {
                 // Already seen (a duplicate) or out of order. The link to us is a
@@ -399,7 +418,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                     sequenceNumber: connection.localSequence,
                     acknowledgmentNumber: connection.remoteSequence,
                     flags: VPhoneTCPFlags.ack,
-                    windowSize: advertisedWindowSize(connection),
+                    windowSize: advertisedWindowField(connection),
                 ), connection: connection)
             }
         }
@@ -444,7 +463,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                 sequenceNumber: connection.localSequence,
                 acknowledgmentNumber: connection.remoteSequence,
                 flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.psh,
-                windowSize: advertisedWindowSize(connection),
+                windowSize: advertisedWindowField(connection),
                 payload: data,
             ), connection: connection)
         }
@@ -457,7 +476,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
                 sequenceNumber: connection.localSequence,
                 acknowledgmentNumber: connection.remoteSequence,
                 flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.fin,
-                windowSize: advertisedWindowSize(connection),
+                windowSize: advertisedWindowField(connection),
             ), connection: connection)
             finishIfBothClosed(connection)
             if connection.state == .closing, connection.pendingToGuest.isEmpty { return }
@@ -528,13 +547,21 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         }
     }
 
-    /// The window we advertise to the guest.
+    /// The window field we advertise to the guest, in the units the handshake
+    /// agreed on.
     ///
     /// Shut while data is still queued toward the host, so the guest stops
-    /// sending instead of piling more into a queue that cannot drain. A window
+    /// sending instead of piling more into a queue that cannot drain; a window
     /// update goes out once the backlog clears (see `flushToHost`).
-    private func advertisedWindowSize(_ connection: Connection) -> UInt16 {
-        connection.pendingToHost.isEmpty ? Self.advertisedWindow : 0
+    private func advertisedWindowField(_ connection: Connection) -> UInt16 {
+        let window = connection.pendingToHost.isEmpty ? Self.advertisedWindow : 0
+        guard connection.windowScaleNegotiated else { return window }
+        return window >> UInt16(Self.ourWindowScaleShift)
+    }
+
+    /// Widest window that shift can express.
+    private static func expand(_ field: UInt16, by shift: Int) -> UInt32 {
+        shift == 0 ? UInt32(field) : UInt32(field) << UInt32(shift)
     }
 
     // MARK: - Host to guest
@@ -596,10 +623,13 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             sequenceNumber: connection.localSequence,
             acknowledgmentNumber: connection.remoteSequence,
             flags: VPhoneTCPFlags.syn | VPhoneTCPFlags.ack,
-            windowSize: advertisedWindowSize(connection),
+            windowSize: advertisedWindowField(connection),
             advertisedMSS: Self.ourMSS,
+            advertisedWindowScale: connection.windowScaleNegotiated ? Self.ourWindowScaleShift : nil,
         ), connection: connection)
-        Self.log.info("handshake: SYN-ACK out, guest MSS \(connection.peerMSS)")
+        Self.log.info(
+            "handshake: SYN-ACK out, guest MSS \(connection.peerMSS, privacy: .public), window scale \(connection.windowScaleNegotiated ? Self.ourWindowScaleShift : 0, privacy: .public)",
+        )
     }
 
     private func sendAcknowledgment(_ connection: Connection) {
@@ -609,7 +639,7 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             sequenceNumber: connection.localSequence,
             acknowledgmentNumber: connection.remoteSequence,
             flags: VPhoneTCPFlags.ack,
-            windowSize: advertisedWindowSize(connection),
+            windowSize: advertisedWindowField(connection),
         ), connection: connection)
     }
 
