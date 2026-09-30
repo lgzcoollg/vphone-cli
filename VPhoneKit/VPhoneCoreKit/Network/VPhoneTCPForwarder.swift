@@ -66,8 +66,9 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     /// advertise window scaling, so this is the whole window.
     private static let advertisedWindow: UInt16 = 65535
     /// Largest segment we will send the guest: the DHCP-advertised MTU less the
-    /// IPv4 and TCP headers. Sent as option 2 in the SYN-ACK.
-    private static let ourMSS = 1240
+    /// IPv4 and TCP headers. Sent as option 2 in the SYN-ACK. Keep in step with
+    /// `VPhoneUserspaceNetworkConfiguration.default.mtu`.
+    private static let ourMSS = 1460
     /// What to assume when the guest's SYN carries no MSS option. RFC 1122's
     /// floor, chosen so an unadvertised peer never gets an oversized segment.
     private static let defaultPeerMSS = 536
@@ -364,6 +365,8 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             if Self.isAfter(segment.acknowledgmentNumber, connection.sendUna) {
                 connection.sendUna = segment.acknowledgmentNumber
             }
+            let room = Int(Int32(bitPattern: connection.sendWindowRight &- connection.localSequence))
+            Self.log.debug("ack \(segment.acknowledgmentNumber, privacy: .public) window \(segment.windowSize, privacy: .public) room \(room, privacy: .public) queued \(connection.pendingToGuest.count, privacy: .public)")
             flushToGuest(connection)
         }
 

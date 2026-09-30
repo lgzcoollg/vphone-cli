@@ -181,9 +181,17 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     }
 
     /// Hand a finished frame to the guest's side of the pair.
+    ///
+    /// The result matters. This is a datagram socket, so a frame the kernel
+    /// refuses is gone -- and since TCP is an ordered stream, one lost frame
+    /// leaves the guest waiting forever for a segment we never resend. Reporting
+    /// a failure here is the difference between "slow" and "silently stalled".
     private func write(_ frame: [UInt8]) {
-        frame.withUnsafeBytes { raw in
-            _ = send(socket, raw.baseAddress, raw.count, 0)
+        let sent = frame.withUnsafeBytes { raw in
+            send(socket, raw.baseAddress, raw.count, 0)
+        }
+        if sent != frame.count {
+            Self.log.error("frame send failed: \(sent, privacy: .public)/\(frame.count, privacy: .public) errno \(errno, privacy: .public)")
         }
     }
 
@@ -204,23 +212,20 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
             proto: .tcp,
             payload: segment.bytes(source: flow.destinationAddress, destination: flow.sourceAddress),
         )
-        write(VPhoneEthernetFrame(
-            destination: flow.guestHardware,
-            source: .gateway,
-            etherType: .ipv4,
-            payload: packet.bytes,
-        ).bytes)
+        // UDP has the same ceiling TCP does but nothing above to chop it up, and
+        // a QUIC reply is right at the boundary. Fragment rather than hand the
+        // guest something it cannot take.
+        for fragment in packet.fragmented(toFit: configuration.mtu) {
+            write(VPhoneEthernetFrame(
+                destination: flow.guestHardware,
+                source: .gateway,
+                etherType: .ipv4,
+                payload: fragment,
+            ).bytes)
+        }
     }
 
     private func sendUDPReply(flow: VPhoneUDPFlow, payload: [UInt8]) {
-        // UDP has the same MTU ceiling TCP does, and no segmentation to fall
-        // back on: an oversized reply becomes an oversized IP packet that the
-        // guest drops. No fragmentation is implemented yet, so say so loudly
-        // rather than failing silently.
-        let wireSize = payload.count + 8 + 20
-        if wireSize > configuration.mtu {
-            Self.log.error("udp reply \(payload.count, privacy: .public)B exceeds mtu \(self.configuration.mtu, privacy: .public) — dropped")
-        }
         let datagram = VPhoneUDPDatagram(
             sourcePort: flow.destinationPort,
             destinationPort: flow.sourcePort,

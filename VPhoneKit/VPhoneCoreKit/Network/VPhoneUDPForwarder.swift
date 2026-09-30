@@ -61,8 +61,9 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
     /// Flows are forgotten after this long without traffic. UDP has no teardown,
     /// so this is the only thing that bounds the session table.
     private static let idleTimeout: TimeInterval = 30
-    /// Largest datagram kept in one piece. The guest is told MTU 1280, and a UDP
-    /// payload that does not fit is dropped rather than fragmented.
+    /// Largest datagram read from the host in one call. Responses that exceed the
+    /// guest's MTU are fragmented on the way in (see `VPhoneUserspaceNetwork`),
+    /// so nothing is dropped for size here.
     private static let datagramCapacity = 65535
 
     private final class Session {

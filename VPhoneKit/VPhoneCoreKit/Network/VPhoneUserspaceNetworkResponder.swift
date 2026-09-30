@@ -258,6 +258,9 @@ final class VPhoneUserspaceNetworkResponder {
     // MARK: - IPv4
 
     private func respondToIPv4(_ packet: VPhoneIPv4Packet) -> VPhoneUserspaceNetworkOutcome {
+        // A fragment is only part of a datagram, and nothing here reassembles, so
+        // acting on it would mean reading an incomplete transport header.
+        guard !packet.isFragment else { return .drop }
         guard let proto = VPhoneIPProtocol(rawValue: packet.proto) else { return .drop }
         switch proto {
         case .icmp:

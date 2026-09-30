@@ -40,17 +40,26 @@ public struct VPhoneUserspaceNetworkConfiguration: Sendable, Equatable {
     public var hostAddress: VPhoneIPv4Address
     /// The lease handed to the guest. One address is enough: one guest per VM.
     public var guestAddress: VPhoneIPv4Address
-    /// Advertised through DHCP option 26. 1280 keeps the guest's segments
-    /// inside what a VPN tunnel will carry without fragmenting.
+    /// Advertised through DHCP option 26, and the ceiling for everything we send
+    /// the guest.
+    ///
+    /// 1500, not the 1280 the v1.x tunnel work used. That 1280 was chosen so the
+    /// guest's segments would fit a VPN tunnel without fragmenting -- but the
+    /// guest's frames reach the host over a socket pair and leave through a host
+    /// socket whose kernel does its own segmentation, so the tunnel's MTU never
+    /// applied here. Copying it had a real cost: QUIC sends 1280-byte payloads,
+    /// which with UDP and IP headers come to 1308, past the advertised 1280. Every
+    /// one of them was too big to hand the guest, and Safari -- which prefers
+    /// HTTP/3 -- spent its time retrying rather than loading.
     public var mtu: Int
 
     public static let `default` = VPhoneUserspaceNetworkConfiguration(
         hostAddress: VPhoneIPv4Address(192, 168, 127, 1),
         guestAddress: VPhoneIPv4Address(192, 168, 127, 3),
-        mtu: 1280,
+        mtu: 1500,
     )
 
-    public init(hostAddress: VPhoneIPv4Address, guestAddress: VPhoneIPv4Address, mtu: Int = 1280) {
+    public init(hostAddress: VPhoneIPv4Address, guestAddress: VPhoneIPv4Address, mtu: Int = 1500) {
         self.hostAddress = hostAddress
         self.guestAddress = guestAddress
         self.mtu = mtu
@@ -139,6 +148,12 @@ struct VPhoneIPv4Packet {
     var identification: UInt16
     var payload: [UInt8]
 
+    /// Fragment offset in eight-byte units. Non-zero only in fragments after the
+    /// first.
+    var fragmentOffset: UInt16 = 0
+    /// Set on every fragment but the last.
+    var moreFragments = false
+
     init(
         source: VPhoneIPv4Address,
         destination: VPhoneIPv4Address,
@@ -155,14 +170,59 @@ struct VPhoneIPv4Packet {
         self.payload = payload
     }
 
+    /// Split so every fragment's IP datagram fits `mtu`.
+    ///
+    /// Only the sending side implements this: the guest reassembles, and it is
+    /// the only side that has to. Slices are multiples of eight because the
+    /// header's offset field counts eight-byte units, and the last fragment
+    /// carries the payload's remainder however it falls.
+    func fragmented(toFit mtu: Int) -> [[UInt8]] {
+        let headerSize = 20
+        guard totalLength > mtu, !payload.isEmpty else { return [bytes] }
+        let maxSlice = ((mtu - headerSize) / 8) * 8
+        guard maxSlice > 0 else { return [bytes] }
+
+        let identifier = identification == 0 ? UInt16.random(in: 1 ... UInt16.max) : identification
+        var fragments: [[UInt8]] = []
+        var offset = 0
+        while offset < payload.count {
+            let end = min(offset + maxSlice, payload.count)
+            let isLast = end >= payload.count
+            var fragment = VPhoneIPv4Packet(
+                source: source,
+                destination: destination,
+                proto: VPhoneIPProtocol(rawValue: proto) ?? .icmp,
+                ttl: ttl,
+                identification: identifier,
+                payload: Array(payload[offset ..< end]),
+            )
+            fragment.fragmentOffset = UInt16(offset / 8)
+            fragment.moreFragments = !isLast
+            fragments.append(fragment.bytes)
+            offset = end
+        }
+        return fragments
+    }
+
     var totalLength: Int { 20 + payload.count }
+
+    /// True when this is one piece of a larger datagram. Nothing here reassembles,
+    /// so such a packet cannot be handled and has to be dropped rather than
+    /// misread: only the first fragment even carries the transport header.
+    var isFragment: Bool { moreFragments || fragmentOffset != 0 }
+
+    /// Bit 0x2000 marks a fragment that is not the last; bits 0..12 hold the
+    /// offset in eight-byte units. A single unfragmented packet leaves both zero.
+    private var flagsAndFragmentOffset: UInt16 {
+        (moreFragments ? 0x2000 : 0) | (fragmentOffset & 0x1FFF)
+    }
 
     var bytes: [UInt8] {
         var header: [UInt8] = [
             0x45, 0x00,
             UInt8(truncatingIfNeeded: totalLength >> 8), UInt8(truncatingIfNeeded: totalLength),
             UInt8(truncatingIfNeeded: identification >> 8), UInt8(truncatingIfNeeded: identification),
-            0x40, 0x00, // don't fragment: the guest should never exceed our MTU
+            UInt8((flagsAndFragmentOffset) >> 8), UInt8(truncatingIfNeeded: flagsAndFragmentOffset),
             ttl, proto,
         ]
         header += [0, 0] // checksum placeholder
@@ -178,10 +238,12 @@ struct VPhoneIPv4Packet {
         guard bytes.count >= 20, bytes[0] >> 4 == 4 else { return nil }
         let headerLength = Int(bytes[0] & 0x0F) * 4
         guard headerLength >= 20, bytes.count >= headerLength else { return nil }
-        // A fragment would need reassembly, which a DHCP/ARP/ICMP responder
-        // never sees. Dropping is correct; the guest retries.
-        let fragmentOffset = UInt16(bytes[6] & 0x1F) << 8 | UInt16(bytes[7])
-        guard fragmentOffset == 0, bytes[6] & 0x20 == 0 else { return nil }
+        // Fragments are parsed rather than refused, so that the fields survive a
+        // round trip and the caller decides. Carrying one is not something this
+        // side can do -- nothing here reassembles -- so whoever handles the
+        // packet has to drop a fragment it cannot complete.
+        fragmentOffset = UInt16(bytes[6] & 0x1F) << 8 | UInt16(bytes[7])
+        moreFragments = bytes[6] & 0x20 != 0
         let declared = Int(UInt16(bytes[2]) << 8 | UInt16(bytes[3]))
         guard declared >= headerLength, bytes.count >= declared else { return nil }
 
