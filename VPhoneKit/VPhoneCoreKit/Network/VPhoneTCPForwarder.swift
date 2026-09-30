@@ -87,6 +87,14 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     /// own receive buffer applies backpressure beyond this: we stop draining it,
     /// so the kernel stops acknowledging the server and the server stops sending.
     private static let maxPendingToGuest = 1 << 20
+    /// How long to wait for an acknowledgment before sending the data again.
+    ///
+    /// Has to clear the guest's delayed-acknowledgment timer *and* a round trip
+    /// over whatever the host is tunnelling through; WARP alone can be 200 ms,
+    /// and retransmitting into a healthy connection wastes the bandwidth this
+    /// exists to protect. Still far below the thirty-second client-side timeouts
+    /// that a stalled transfer otherwise ends in.
+    private static let retransmitInterval: TimeInterval = 1.5
     private static let log = Logger(subsystem: "com.vphone.tunnel", category: "tcp")
 
     private enum State {
@@ -143,13 +151,31 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         /// sequence number we may send. Starts at `localSequence` so nothing goes
         /// out until the guest's first ACK says how much room there is.
         var sendWindowRight: UInt32
-        /// Earliest sequence number the guest has not acknowledged. Reported, not
-        /// relied on: the window check above is what prevents loss.
+        /// Earliest sequence number the guest has not acknowledged.
         var sendUna: UInt32
+        /// Bytes sent toward the guest that it has never acknowledged. A number
+        /// that stays large while nothing moves is the signature of a stalled
+        /// transfer: the peer is waiting for a segment we are not sending again.
+        var unacknowledgedBytes: Int {
+            Int(Int32(bitPattern: localSequence &- sendUna))
+        }
+        /// When the guest's acknowledgment last moved, so a stalled connection
+        /// can be told from a slow one.
+        var lastAckAdvance = Date()
         /// Read from the host, not yet sent, because the window had no room.
         var pendingToGuest: [UInt8] = []
         /// A FIN queued behind `pendingToGuest`.
         var pendingFIN = false
+        /// Everything sent toward the guest that it has not acknowledged, oldest
+        /// first, with the sequence number the first byte went out under.
+        ///
+        /// Kept because the link not losing packets is not the same as every
+        /// segment arriving: one unacknowledged segment stops the connection
+        /// where it stands, and nothing here sends it again. That is what turned
+        /// a lost segment into a thirty-second timeout.
+        var sentNotAcked: [UInt8] = []
+        var sentNotAckedSequence: UInt32 = 0
+        var retransmitTimer: DispatchSourceTimer?
         /// Set while the host read source is suspended because the buffer above
         /// is full. Sources are level-triggered, so one that is not drained has
         /// to be suspended or it spins.
@@ -389,6 +415,15 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
             connection.sendWindowRight = segment.acknowledgmentNumber &+ Self.expand(segment.windowSize, by: connection.peerWindowScale)
             if Self.isAfter(segment.acknowledgmentNumber, connection.sendUna) {
                 connection.sendUna = segment.acknowledgmentNumber
+                connection.lastAckAdvance = Date()
+            }
+            // Release the copy of anything the guest has taken, so a healthy
+            // connection holds nothing.
+            let acknowledged = Int(Int32(bitPattern: segment.acknowledgmentNumber &- connection.sentNotAckedSequence))
+            if acknowledged > 0 {
+                let drop = min(acknowledged, connection.sentNotAcked.count)
+                connection.sentNotAcked.removeFirst(drop)
+                connection.sentNotAckedSequence &+= UInt32(drop)
             }
             let room = Int(Int32(bitPattern: connection.sendWindowRight &- connection.localSequence))
             Self.log.debug("ack \(segment.acknowledgmentNumber, privacy: .public) window \(segment.windowSize, privacy: .public) room \(room, privacy: .public) queued \(connection.pendingToGuest.count, privacy: .public)")
@@ -644,9 +679,56 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     }
 
     private func send(_ segment: VPhoneTCPSegment, connection: Connection) {
-        if !segment.payload.isEmpty { connection.localSequence &+= UInt32(segment.payload.count) }
+        if !segment.payload.isEmpty {
+            if connection.sentNotAcked.isEmpty { connection.sentNotAckedSequence = segment.sequenceNumber }
+            connection.sentNotAcked += segment.payload
+            connection.localSequence &+= UInt32(segment.payload.count)
+            armRetransmission(connection)
+        }
         if segment.hasSYN || segment.hasFIN { connection.localSequence &+= 1 }
         deliver(connection.flow, segment)
+    }
+
+    /// Send a copy of already-sent data, without touching our send sequence.
+    private func resend(_ data: [UInt8], sequence: UInt32, connection: Connection) {
+        deliver(connection.flow, VPhoneTCPSegment(
+            sourcePort: connection.flow.destinationPort,
+            destinationPort: connection.flow.sourcePort,
+            sequenceNumber: sequence,
+            acknowledgmentNumber: connection.remoteSequence,
+            flags: VPhoneTCPFlags.ack | VPhoneTCPFlags.psh,
+            windowSize: advertisedWindowField(connection),
+            payload: data,
+        ))
+    }
+
+    /// Send everything the guest has not acknowledged, once, now.
+    private func retransmit(_ connection: Connection) {
+        connection.retransmitTimer?.cancel()
+        connection.retransmitTimer = nil
+        guard !connection.isClosed, !connection.sentNotAcked.isEmpty else { return }
+
+        Self.log.info(
+            "retransmitting \(connection.sentNotAcked.count, privacy: .public)B to :\(connection.flow.sourcePort, privacy: .public) unacknowledged for \(String(format: "%.1f", Date().timeIntervalSince(connection.lastAckAdvance)), privacy: .public)s",
+        )
+        var sequence = connection.sentNotAckedSequence
+        var offset = 0
+        while offset < connection.sentNotAcked.count {
+            let end = min(offset + connection.peerMSS, connection.sentNotAcked.count)
+            resend(Array(connection.sentNotAcked[offset ..< end]), sequence: sequence, connection: connection)
+            sequence &+= UInt32(end - offset)
+            offset = end
+        }
+        armRetransmission(connection)
+    }
+
+    private func armRetransmission(_ connection: Connection) {
+        guard connection.retransmitTimer == nil, !connection.sentNotAcked.isEmpty, !connection.isClosed else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.retransmitInterval)
+        timer.setEventHandler { [weak self] in self?.retransmit(connection) }
+        timer.resume()
+        connection.retransmitTimer = timer
     }
 
     /// A RST for a flow we are not going to serve.
@@ -677,8 +759,9 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
         guard !connection.isClosed else { return }
         connection.isClosed = true
         let lifetime = Date().timeIntervalSince(connection.openedAt)
+        let sinceAck = Date().timeIntervalSince(connection.lastAckAdvance)
         Self.log.info(
-            "\(connection.flow.destinationAddress, privacy: .public):\(connection.flow.destinationPort, privacy: .public) <- :\(connection.flow.sourcePort, privacy: .public) closed after \(String(format: "%.1f", lifetime), privacy: .public)s  up \(connection.bytesToHost, privacy: .public)B  down \(connection.bytesToGuest, privacy: .public)B",
+            "\(connection.flow.destinationAddress, privacy: .public):\(connection.flow.destinationPort, privacy: .public) <- :\(connection.flow.sourcePort, privacy: .public) closed after \(String(format: "%.1f", lifetime), privacy: .public)s  up \(connection.bytesToHost, privacy: .public)B  down \(connection.bytesToGuest, privacy: .public)B  unacked \(connection.unacknowledgedBytes, privacy: .public)B  lastAck \(String(format: "%.1f", sinceAck), privacy: .public)s ago",
         )
         close(connection)
         connections[connection.flow.key] = nil
@@ -687,6 +770,8 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     private func close(_ connection: Connection) {
         connection.writeSource?.cancel()
         connection.writeSource = nil
+        connection.retransmitTimer?.cancel()
+        connection.retransmitTimer = nil
         // A suspended source must be resumed before it can be cancelled;
         // libdispatch aborts the process for releasing a suspended object.
         if connection.readSuspended {
