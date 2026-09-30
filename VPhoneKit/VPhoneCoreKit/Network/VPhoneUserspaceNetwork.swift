@@ -55,10 +55,19 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
     private var responder: VPhoneUserspaceNetworkResponder
     /// Carries the guest's UDP out to the host and the answers back. Owns one
     /// socket per flow, so it is the thing `stop()` has to tear down.
-    private let forwarder: VPhoneUDPForwarder
+    ///
+    /// `lazy` because building it needs a closure over `self`, and a stored
+    /// property cannot be captured until every property is initialised. First
+    /// touch is always on `queue`.
+    private lazy var forwarder = VPhoneUDPForwarder(configuration: configuration, queue: queue) { [weak self] flow, payload in
+        self?.sendUDPReply(flow: flow, payload: payload)
+    }
+
     /// Terminates the guest's TCP against host sockets. Owns one connection per
     /// flow, and emits segments of its own rather than echoing ours.
-    private let tcpForwarder: VPhoneTCPForwarder
+    private lazy var tcpForwarder = VPhoneTCPForwarder(queue: queue) { [weak self] flow, segment in
+        self?.sendTCPReply(flow: flow, segment: segment)
+    }
 
     /// Largest frame we will accept from the guest. Ethernet header plus a
     /// jumbo-sized IP packet; the guest is expected to stay within `mtu`.
@@ -87,14 +96,6 @@ public final class VPhoneUserspaceNetwork: @unchecked Sendable {
         queue = DispatchQueue(label: "com.vphone.userspace-network")
         responder = VPhoneUserspaceNetworkResponder(configuration: configuration)
         self.configuration = configuration
-        // A reply from the forwarder is wrapped without consulting the responder
-        // again: the flow already carries both ends and the guest's MAC.
-        forwarder = VPhoneUDPForwarder(configuration: configuration, queue: queue) { [weak self] flow, payload in
-            self?.sendUDPReply(flow: flow, payload: payload)
-        }
-        tcpForwarder = VPhoneTCPForwarder(queue: queue) { [weak self] flow, segment in
-            self?.sendTCPReply(flow: flow, segment: segment)
-        }
     }
 
     /// The object to hand to `VZVirtioNetworkDeviceConfiguration.attachment`.
