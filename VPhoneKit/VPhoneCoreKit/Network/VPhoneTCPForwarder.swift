@@ -115,41 +115,50 @@ final class VPhoneTCPForwarder: @unchecked Sendable {
     /// that two connections to the same peer do not look alike.
     private var sequenceCounter: UInt32 = UInt32.random(in: 0 ... UInt32.max)
 
+    /// Marks `queue` as ours, so `connectionCount` can tell whether it is already
+    /// on it rather than deadlocking against itself.
+    private static let queueKey = DispatchSpecificKey<Void>()
+
     init(queue: DispatchQueue, deliver: @escaping Deliver) {
         self.queue = queue
         self.deliver = deliver
+        queue.setSpecific(key: Self.queueKey, value: ())
     }
 
     /// Live connections, for tests and diagnostics.
-    var connectionCount: Int { queue.sync { connections.count } }
+    ///
+    /// The only member callable from any thread: off the queue it hops on, on the
+    /// queue it reads directly. Hopping unconditionally is what deadlocked
+    /// `start()` in the UDP forwarder.
+    var connectionCount: Int {
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil { return connections.count }
+        return queue.sync { connections.count }
+    }
 
     func start() {
-        queue.sync {
-            guard !isStopped, reaper == nil else { return }
-            let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(deadline: .now() + Self.idleTimeout, repeating: Self.idleTimeout)
-            timer.setEventHandler { [weak self] in self?.reapIdle() }
-            timer.resume()
-            reaper = timer
-        }
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !isStopped, reaper == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.idleTimeout, repeating: Self.idleTimeout)
+        timer.setEventHandler { [weak self] in self?.reapIdle() }
+        timer.resume()
+        reaper = timer
     }
 
     func stop() {
-        queue.sync {
-            guard !isStopped else { return }
-            isStopped = true
-            reaper?.cancel()
-            reaper = nil
-            for connection in connections.values { close(connection) }
-            connections.removeAll()
-        }
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !isStopped else { return }
+        isStopped = true
+        reaper?.cancel()
+        reaper = nil
+        for connection in connections.values { close(connection) }
+        connections.removeAll()
     }
 
-    /// Handle one segment from the guest. Called on `queue`.
+    /// Handle one segment from the guest. On `queue`.
     func receive(_ segment: VPhoneTCPSegment, for flow: VPhoneTCPFlow) {
-        queue.async { [weak self] in
-            self?.handle(segment, flow: flow)
-        }
+        dispatchPrecondition(condition: .onQueue(queue))
+        handle(segment, flow: flow)
     }
 
     // MARK: - Segment handling

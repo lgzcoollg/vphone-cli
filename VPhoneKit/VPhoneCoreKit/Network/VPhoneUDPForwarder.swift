@@ -89,48 +89,56 @@ final class VPhoneUDPForwarder: @unchecked Sendable {
     private var reaper: DispatchSourceTimer?
     private var isStopped = false
 
+    /// Marks `queue` as ours, so `sessionCount` can tell whether it is already on
+    /// it rather than deadlocking against itself.
+    private static let queueKey = DispatchSpecificKey<Void>()
+
     init(configuration: VPhoneUserspaceNetworkConfiguration, queue: DispatchQueue, deliver: @escaping Deliver) {
         self.configuration = configuration
         self.queue = queue
         self.deliver = deliver
+        queue.setSpecific(key: Self.queueKey, value: ())
     }
 
     /// Number of live flows. Exposed for tests and diagnostics.
-    var sessionCount: Int { queue.sync { sessions.count } }
+    ///
+    /// The only member callable from any thread: off the queue it hops on, on the
+    /// queue it reads directly. Hopping unconditionally would deadlock, which is
+    /// exactly the bug `start()` had.
+    var sessionCount: Int {
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil { return sessions.count }
+        return queue.sync { sessions.count }
+    }
 
     func start() {
-        queue.sync {
-            guard !isStopped, reaper == nil else { return }
-            let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(deadline: .now() + Self.idleTimeout, repeating: Self.idleTimeout)
-            timer.setEventHandler { [weak self] in self?.reapIdleSessions() }
-            timer.resume()
-            reaper = timer
-        }
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !isStopped, reaper == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.idleTimeout, repeating: Self.idleTimeout)
+        timer.setEventHandler { [weak self] in self?.reapIdleSessions() }
+        timer.resume()
+        reaper = timer
     }
 
     func stop() {
-        queue.sync {
-            guard !isStopped else { return }
-            isStopped = true
-            reaper?.cancel()
-            reaper = nil
-            for session in sessions.values { closeSession(session) }
-            sessions.removeAll()
-        }
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !isStopped else { return }
+        isStopped = true
+        reaper?.cancel()
+        reaper = nil
+        for session in sessions.values { closeSession(session) }
+        sessions.removeAll()
     }
 
-    /// Send one guest datagram onward. `flow` names both ends.
+    /// Send one guest datagram onward. `flow` names both ends. On `queue`.
     func send(_ payload: [UInt8], for flow: VPhoneUDPFlow) {
-        queue.async { [weak self] in
-            guard let self, !self.isStopped else { return }
-            let session = self.session(for: flow)
-            guard let session else { return }
-            session.lastActivity = Date()
-            payload.withUnsafeBytes { raw in
-                // Qualified: the type has its own `send` for guest payloads.
-                _ = Darwin.send(session.socket, raw.baseAddress, raw.count, 0)
-            }
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !isStopped else { return }
+        guard let session = session(for: flow) else { return }
+        session.lastActivity = Date()
+        payload.withUnsafeBytes { raw in
+            // Qualified: the type has its own `send` for guest payloads.
+            _ = Darwin.send(session.socket, raw.baseAddress, raw.count, 0)
         }
     }
 
