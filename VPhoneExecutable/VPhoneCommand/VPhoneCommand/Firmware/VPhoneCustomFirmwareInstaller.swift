@@ -23,7 +23,6 @@ import VPhoneSign
 struct VPhoneCustomFirmwareInstaller {
     let bundle: URL
     let resources: VPhoneResources
-    let forceDyldSharedCacheMaxSlide: Bool
 
     /// Guest system files belong to root:wheel.
     private static let guestOwner: (uid: uid_t, gid: gid_t) = (0, 0)
@@ -47,17 +46,9 @@ struct VPhoneCustomFirmwareInstaller {
         return build
     }
 
-    static func elevate(
-        bundle: URL,
-        resources: VPhoneResources,
-        forceDyldSharedCacheMaxSlide: Bool,
-    ) throws -> Int32 {
+    static func elevate(bundle: URL, resources: VPhoneResources) throws -> Int32 {
         if geteuid() == 0 {
-            try VPhoneCustomFirmwareInstaller(
-                bundle: bundle,
-                resources: resources,
-                forceDyldSharedCacheMaxSlide: forceDyldSharedCacheMaxSlide,
-            ).run()
+            try VPhoneCustomFirmwareInstaller(bundle: bundle, resources: resources).run()
             return 0
         }
         throw ValidationError("CFW installation needs root. Run this command with sudo.")
@@ -427,49 +418,43 @@ struct VPhoneCustomFirmwareInstaller {
         // The version branches stay: they and the declarations' applicability say
         // the same thing, and this is what a VM with no plan still follows.
         if version.hasPrefix("27.") {
-            if on("iomfb_force_kern") {
+            if on("dyld-boot-iomfb_force_kern") {
                 try patch("patch-iomfb-force-kern", [dsc])
             }
-            if on("dsc_maxslide.zero") {
+            if on("dyld-boot-maxslide") {
                 try patch("patch-dsc-maxslide", [dsc])
             }
-            if on("lsd_embedded_reg.entitlement_gate") {
+            if on("dyld-boot-lsd_embedded_reg") {
                 try patch("patch-lsd-embedded-reg", [dsc])
             }
-            if on("xpc_lwcr") {
+            if on("dyld-boot-xpc_lwcr") {
                 try patch("patch-xpc-lwcr", [dsc])
             }
-            if on("lockdown_mode.sysctl_error_gate") {
+            if on("dyld-boot-lockdown_mode") {
                 try patch("patch-lockdown-mode", [dsc])
             }
         } else if version.hasPrefix("26.0") || version.hasPrefix("18.") {
-            if on("dsc.iomfb_swapend") {
+            if on("dyld-boot-iomfb_swapend") {
                 try patch("patch-iomfb-swapend", [dsc, "--target-size", "0x560"])
-            }
-        } else if forceDyldSharedCacheMaxSlide {
-            // Superseded by the plan: `dsc_maxslide.zero` is pinned to iOS 27, so
-            // a VM with a plan cannot force it onto a 26.x base any more.
-            if on("dsc_maxslide.zero") {
-                try patch("patch-dsc-maxslide", [dsc, "--force"])
             }
         }
         // Version-agnostic: the guest is hacktivated on every base, so the
         // profile check this opens fails on every base too.
-        if on("mis_trust_auth") {
+        if on("dyld-cfw-mis_trust_auth") {
             try patch("patch-mis-trust-auth", [dsc])
         }
         // These former EXP patches pair with the kernel OID rename and the
         // camera DeviceTree additions in the public JB firmware pipeline.
-        if on("hv_vmm_dsc") {
+        if on("dyld-exp-hv_vmm") {
             try patch("patch-hv-vmm-dsc", [dsc])
         }
-        if on("camera_dsc") {
+        if on("dyld-cfw-camera") {
             try patch("patch-camera-dsc", [dsc, (dsc as NSString).appendingPathComponent("dyld_shared_cache_arm64e")])
         }
         // The preset's own parameter first; `SPOOF_BUILD` still works for a VM
         // whose preset does not set one.
         let buildVersion = plan?.parameters[FirmwareGuestSystemPatchSet.buildVersionParameter] ?? spoofBuild
-        if let build = buildVersion, !build.isEmpty, on("guest.build_version") {
+        if let build = buildVersion, !build.isEmpty, on("system-systemversion-cfw-build_version") {
             for path in [
                 "System/Library/CoreServices/SystemVersion.plist",
                 "System/Cryptexes/OS/System/Library/CoreServices/SystemVersion.plist",
@@ -477,7 +462,7 @@ struct VPhoneCustomFirmwareInstaller {
                 try patchCopy(of: path, in: system, work: work, verb: "patch-build-version", arguments: [build])
             }
         }
-        if on("seputil.gigalocker_uuid") {
+        if on("system-seputil-boot-gigalocker_uuid") {
             try patchMachO(
                 system: system,
                 work: work,
@@ -486,7 +471,7 @@ struct VPhoneCustomFirmwareInstaller {
                 identifier: "com.apple.seputil",
             )
         }
-        if version.hasPrefix("27."), on("diskimagesiod.is_mount_complete") {
+        if version.hasPrefix("27."), on("system-diskimagesiod-cfw-is_mount_complete") {
             try patchMachO(
                 system: system,
                 work: work,
@@ -495,13 +480,13 @@ struct VPhoneCustomFirmwareInstaller {
                 preserveEntitlements: true,
             )
         }
-        if on("guest.gigalocker_rename") {
+        if on("system-gigalocker-boot-rename") {
             try renameGigalocker(data: data)
         }
-        if on("guest.gpu_bundle") {
+        if on("system-extensions-boot-gpu_bundle") {
             try installGPUBundle(restore: restore, system: system, owner: owner)
         }
-        if on("launchd_cache_loader.unsecure_cache_gate") {
+        if on("system-launchd_cache_loader-boot-unsecure_cache_gate") {
             try patchMachO(
                 system: system,
                 work: work,
@@ -510,7 +495,7 @@ struct VPhoneCustomFirmwareInstaller {
                 identifier: "com.apple.launchd_cache_loader",
             )
         }
-        if on("mobileactivationd.should_hactivate") {
+        if on("system-mobileactivationd-boot-should_hactivate") {
             try patchMachO(
                 system: system,
                 work: work,
@@ -518,16 +503,16 @@ struct VPhoneCustomFirmwareInstaller {
                 verb: "patch-mobileactivationd",
             )
         }
-        if on("watchdogd.hv_vmm_cache") {
+        if on("system-watchdogd-exp-hv_vmm_cache") {
             try patchWatchdog(system: system, work: work)
         }
-        if on("guest.vphoned") {
+        if on("system-vphoned-boot-install") {
             try installVphoned(system: system, work: work)
         }
-        if on("guest.environment") {
+        if on("system-launchdaemons-boot-environment") {
             try installEnvironment(system: system)
         }
-        if on("launchd_jetsam.panic_guard_bypass") {
+        if on("system-launchd-boot-jetsam_panic_guard_bypass") {
             try patchMachO(
                 system: system,
                 work: work,
@@ -537,10 +522,32 @@ struct VPhoneCustomFirmwareInstaller {
                 injectedDylibPath: "/vh",
             )
         }
-        if on("guest.debugserver") {
+        if on("system-installd-cfw-adhoc_signature") {
+            // No bytes of installd's own change: the hook rides in on a weak
+            // load command and does its work through dyld interposition.
+            try patchMachO(
+                system: system,
+                work: work,
+                path: "usr/libexec/installd",
+                identifier: "com.apple.installd",
+                preserveEntitlements: true,
+                injectedDylibPath: "/usr/lib/libmisfix.dylib",
+            )
+        }
+        if on("system-misagent-cfw-device_identity") {
+            try patchMachO(
+                system: system,
+                work: work,
+                path: "usr/libexec/misagent",
+                identifier: "com.apple.misagent",
+                preserveEntitlements: true,
+                injectedDylibPath: "/usr/lib/libmisfix.dylib",
+            )
+        }
+        if on("system-debugserver-cfw-install") {
             try patchDebugserver(system: system, work: work)
         }
-        if version.hasPrefix("27."), on("campo.entitlements") {
+        if version.hasPrefix("27."), on("system-campo-cfw-entitlements") {
             try patchCampo(system: system, work: work)
         }
     }
@@ -790,6 +797,23 @@ struct VPhoneCustomFirmwareInstaller {
         } else {
             try system.createSymlink(target: target, at: alias)
         }
+        try installMISFixDefaults(system: system)
+    }
+
+    /// libmisfix's settings file, and only when the guest has none.
+    ///
+    /// Unlike the libraries above this is not the bundle's to own: it carries a
+    /// per-machine choice, so re-running `cfw install` must not put the
+    /// shipped, empty copy back over a UDID someone set.
+    private func installMISFixDefaults(system: VPhoneConfinedDirectory) throws {
+        let name = "libmisfix.plist"
+        let path = "usr/lib/\(name)"
+        guard try !system.exists(path) else {
+            print("  [·] \(path): already present, left as it is")
+            return
+        }
+        let source = try VPhoneGuestBinaries.resolve(name)
+        try system.replaceFile(path, fromFileAt: source, mode: 0o644, owner: Self.guestOwner)
     }
 
     private func patchWatchdog(system: VPhoneConfinedDirectory, work: WorkDirectory) throws {
@@ -890,11 +914,15 @@ struct VPhoneCustomFirmwareInstaller {
         )
     }
 
+    /// Stage a guest Mach-O, patch it, re-sign it and put it back.
+    ///
+    /// `verb` is optional: a binary that only needs a library injected — as
+    /// installd does for libmisfix — has no bytes of its own to change.
     private func patchMachO(
         system: VPhoneConfinedDirectory,
         work: WorkDirectory,
         path: String,
-        verb: String,
+        verb: String? = nil,
         identifier: String? = nil,
         preserveEntitlements: Bool = false,
         injectedDylibPath: String? = nil,
@@ -911,7 +939,9 @@ struct VPhoneCustomFirmwareInstaller {
             preserveEntitlements
                 ? try VPhoneSigner.entitlements(ofFileAt: staged).first(where: { !$0.isEmpty })
                 : nil
-        try patch(verb, [staged.path])
+        if let verb {
+            try patch(verb, [staged.path])
+        }
         if let injectedDylibPath {
             try patch("inject-dylib", [staged.path, injectedDylibPath])
         }
@@ -1106,13 +1136,11 @@ struct VPhoneCustomFirmwareInstallRootCommand: ParsableCommand {
 
     @Argument(help: "VM bundle path") var bundle: String
     @Option(help: "Resource base") var resources: String
-    @Flag(name: .customLong("force-dsc-maxslide")) var forceDyldSharedCacheMaxSlide = false
 
     func run() throws {
         try VPhoneCustomFirmwareInstaller(
             bundle: URL(fileURLWithPath: bundle),
             resources: VPhoneResources(base: URL(fileURLWithPath: resources)),
-            forceDyldSharedCacheMaxSlide: forceDyldSharedCacheMaxSlide,
         ).run()
     }
 }
