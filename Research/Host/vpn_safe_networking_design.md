@@ -197,6 +197,40 @@ never obtains root itself — so E has to come with an answer for privilege (a n
 helper path, or an explicit one-time `sudo`), and with a teardown story for the
 interface it leaves behind.
 
+## What each candidate does to the host network
+
+This turned out to matter more than the line count. The failure being fixed is
+not only "the guest has no network when a VPN is up" — hosts have also been
+observed to lose their VPN once a VM is running, and that points at *how much of
+the host's own networking a candidate takes over*.
+
+| | takes over | host impact |
+| --- | --- | --- |
+| `nat` / `bridged` | vmnet + Internet Sharing: its own pf NAT anchor, `bridge100`, `bootpd` | global. Enabling it installs system-level network configuration, which is the likely cause of the host losing its VPN when a VM starts. Note also that vmnet does not self-heal when the VPN drops; its daemon has to be restarted. |
+| **A** (userspace stack) | nothing | none. No interface, no route, no pf rule, no daemon. |
+| **E** (utun + NAT) | one utun interface and one `192.168.x.0/24` route | local. The default route is untouched, so a VPN keeps working; the added interface disappears with the process. |
+
+### A discarded variant: keep `nat`, fix the pf rule (J)
+
+The root cause is narrower than "the two directions no longer match". Reading the
+v1.x notes again, the actual step is outbound route selection: the guest's packet
+enters from `bridge100`, the routing table sees a public destination, and the
+default route sends it out `utun5`. Internet Sharing's rule is
+`nat on en5 from 192.168.64.0/24 to any`, so it does not match a packet leaving
+`utun5`, no translation happens, and a packet sourced from `192.168.64.x` enters
+the tunnel and is dropped.
+
+So one could keep the attachment and only re-point the masquerade:
+
+```
+nat on utun5 from 192.168.64.0/24 to any -> (utun5:0)
+```
+
+~200–400 lines, no userspace stack, no utun. It is rejected here anyway, for two
+reasons: it keeps vmnet and Internet Sharing in the picture, so the host-side
+impact above stays; and acting on pf needs root, the same objection as E — with
+none of E's reduction in code.
+
 ## Validation
 
 Same shape as the v1.x work, but without the helper: drive the transport the
